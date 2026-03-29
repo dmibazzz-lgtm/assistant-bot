@@ -14,7 +14,7 @@ histories = {}
 
 async def call_claude(messages):
     headers = {
-        "x-api-key": CLAUDE_API_KEY,
+        "x-api-key": CLAUDE_API_KEY.encode('ascii', 'ignore').decode('ascii'),
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
     }
