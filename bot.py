@@ -1,21 +1,42 @@
 import os
 import sys
+import httpx
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-import anthropic
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 
-client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-
 histories = {}
 
+async def call_claude(messages):
+    headers = {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    data = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 500,
+        "system": "You are a helpful personal assistant. Always respond in Russian language. Be warm and friendly.",
+        "messages": messages
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+        result = r.json()
+        return result["content"][0]["text"]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я твой личный ассистент. Чем могу помочь?")
+    name = update.effective_user.first_name
+    await update.message.reply_text(f"Hello {name}! I am your personal assistant. How can I help?")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -23,13 +44,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in histories:
         histories[uid] = []
     histories[uid].append({"role": "user", "content": msg})
-    r = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=500,
-        system="Ты личный ассистент. Отвечай на русском языке.",
-        messages=histories[uid]
-    )
-    reply = r.content[0].text
+    reply = await call_claude(histories[uid])
     histories[uid].append({"role": "assistant", "content": reply})
     await update.message.reply_text(reply)
 
