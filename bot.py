@@ -301,6 +301,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(uid, "assistant", clean)
     await update.message.reply_text(clean)
 
+async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM users WHERE user_id=?", (uid,))
+    conn.execute("DELETE FROM messages WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("Сброс выполнен. Напиши /start")
 # ── ЗАПУСК ──
 
 def main():
@@ -309,6 +317,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("newuser", cmd_newuser))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     jq = app.job_queue
