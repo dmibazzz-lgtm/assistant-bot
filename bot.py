@@ -182,8 +182,7 @@ def main_keyboard():
         [KeyboardButton("🌀 Сферы жизни"), KeyboardButton("💡 Идеи")],
         [KeyboardButton("📊 Дашборд")]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
-
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 def spheres_keyboard():
     buttons = []
     sphere_list = list(SPHERES.items())
