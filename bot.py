@@ -1,5 +1,5 @@
 import os, sys, httpx, sqlite3, json, logging, re
-from datetime import datetime, time
+from datetime import datetime, time as dtime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 
@@ -21,18 +21,22 @@ def init_db():
         profile TEXT DEFAULT '{}')""")
     c.execute("""CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, role TEXT, content TEXT)""")
+        user_id INTEGER, role TEXT, content TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
     c.execute("""CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, text TEXT,
         priority TEXT DEFAULT 'normal',
         sphere TEXT DEFAULT 'general',
+        timeframe TEXT DEFAULT 'week',
         done INTEGER DEFAULT 0,
+        due_date TEXT,
         created_at TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS goals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, text TEXT,
         sphere TEXT DEFAULT 'general',
+        timeframe TEXT DEFAULT 'longterm',
         progress INTEGER DEFAULT 0,
         done INTEGER DEFAULT 0,
         created_at TEXT)""")
@@ -80,10 +84,11 @@ def save_profile(uid, profile):
 
 def save_msg(uid, role, content):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO messages (user_id,role,content) VALUES (?,?,?)", (uid, role, content))
+    conn.execute("INSERT INTO messages (user_id,role,content,created_at) VALUES (?,?,?,?)",
+                 (uid, role, content, datetime.now().isoformat()))
     conn.commit(); conn.close()
 
-def get_history(uid, limit=40):
+def get_history(uid, limit=20):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT role,content FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
@@ -95,34 +100,57 @@ def clear_history(uid):
     conn.execute("DELETE FROM messages WHERE user_id=?", (uid,))
     conn.commit(); conn.close()
 
-def add_task(uid, text, priority="normal", sphere="general"):
+def add_task(uid, text, priority="normal", sphere="general", timeframe="week", due_date=None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO tasks (user_id,text,priority,sphere,created_at) VALUES (?,?,?,?,?)",
-                 (uid, text, priority, sphere, datetime.now().isoformat()))
+    conn.execute("INSERT INTO tasks (user_id,text,priority,sphere,timeframe,due_date,created_at) VALUES (?,?,?,?,?,?,?)",
+                 (uid, text, priority, sphere, timeframe, due_date, datetime.now().isoformat()))
     conn.commit(); conn.close()
 
-def get_tasks(uid, sphere=None, done=0):
+def get_tasks(uid, sphere=None, timeframe=None, priority=None, done=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    query = "SELECT id,text,priority,sphere,timeframe,due_date FROM tasks WHERE user_id=? AND done=?"
+    params = [uid, done]
     if sphere:
-        c.execute("SELECT id,text,priority,sphere FROM tasks WHERE user_id=? AND done=? AND sphere=? ORDER BY id", (uid, done, sphere))
-    else:
-        c.execute("SELECT id,text,priority,sphere FROM tasks WHERE user_id=? AND done=? ORDER BY id", (uid, done))
+        query += " AND sphere=?"; params.append(sphere)
+    if timeframe:
+        query += " AND timeframe=?"; params.append(timeframe)
+    if priority:
+        query += " AND priority=?"; params.append(priority)
+    query += " ORDER BY id"
+    c.execute(query, params)
     rows = c.fetchall(); conn.close(); return rows
 
-def add_goal(uid, text, sphere="general"):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO goals (user_id,text,sphere,created_at) VALUES (?,?,?,?)",
-                 (uid, text, sphere, datetime.now().isoformat()))
-    conn.commit(); conn.close()
-
-def get_goals(uid, sphere=None):
+def get_today_tasks(uid):
+    today = datetime.now().date().isoformat()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    c.execute("""SELECT id,text,priority,sphere,timeframe,due_date FROM tasks
+                 WHERE user_id=? AND done=0 AND (timeframe='today' OR due_date=?)
+                 ORDER BY priority DESC""", (uid, today))
+    rows = c.fetchall(); conn.close(); return rows
+
+def complete_task(task_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE tasks SET done=1 WHERE id=?", (task_id,))
+    conn.commit(); conn.close()
+
+def add_goal(uid, text, sphere="general", timeframe="longterm"):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO goals (user_id,text,sphere,timeframe,created_at) VALUES (?,?,?,?,?)",
+                 (uid, text, sphere, timeframe, datetime.now().isoformat()))
+    conn.commit(); conn.close()
+
+def get_goals(uid, sphere=None, timeframe=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    query = "SELECT id,text,sphere,timeframe,progress FROM goals WHERE user_id=? AND done=?"
+    params = [uid, 0]
     if sphere:
-        c.execute("SELECT id,text,sphere,progress FROM goals WHERE user_id=? AND done=0 AND sphere=?", (uid, sphere))
-    else:
-        c.execute("SELECT id,text,sphere,progress FROM goals WHERE user_id=? AND done=0", (uid,))
+        query += " AND sphere=?"; params.append(sphere)
+    if timeframe:
+        query += " AND timeframe=?"; params.append(timeframe)
+    c.execute(query, params)
     rows = c.fetchall(); conn.close(); return rows
 
 def add_idea(uid, text, sphere="general"):
@@ -149,9 +177,9 @@ def log_sphere_activity(uid, sphere):
 def get_sphere_stats(uid):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""SELECT sphere, COUNT(*) as cnt FROM sphere_activity
+    c.execute("""SELECT sphere, COUNT(*) FROM sphere_activity
                  WHERE user_id=? AND activity_date >= date('now', '-7 days')
-                 GROUP BY sphere ORDER BY cnt DESC""", (uid,))
+                 GROUP BY sphere ORDER BY COUNT(*) DESC""", (uid,))
     rows = c.fetchall(); conn.close()
     return {r[0]: r[1] for r in rows}
 
@@ -170,47 +198,95 @@ SPHERES = {
 SPHERE_KEYS = list(SPHERES.keys())
 
 def main_keyboard():
-    keyboard = [
+    return ReplyKeyboardMarkup([
         [KeyboardButton("📋 Задачи"), KeyboardButton("🎯 Цели")],
         [KeyboardButton("🌀 Сферы жизни"), KeyboardButton("💡 Идеи")],
         [KeyboardButton("📊 Дашборд")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    ], resize_keyboard=True)
+
+def tasks_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 На сегодня", callback_data="tasks_today"),
+         InlineKeyboardButton("📆 На неделю", callback_data="tasks_week")],
+        [InlineKeyboardButton("🗓 На месяц", callback_data="tasks_month"),
+         InlineKeyboardButton("♾ Долгосрочные", callback_data="tasks_longterm")],
+        [InlineKeyboardButton("🔴 Срочные", callback_data="tasks_urgent"),
+         InlineKeyboardButton("✅ Выполненные", callback_data="tasks_done")],
+        [InlineKeyboardButton("📋 Все", callback_data="tasks_all")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+    ])
+
+def goals_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Краткосрочные", callback_data="goals_short"),
+         InlineKeyboardButton("🏔 Долгосрочные", callback_data="goals_long")],
+        [InlineKeyboardButton("📋 Все цели", callback_data="goals_all")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+    ])
 
 def spheres_keyboard():
     buttons = []
-    sphere_list = list(SPHERES.items())
-    for i in range(0, len(sphere_list), 2):
-        row = []
-        for key, label in sphere_list[i:i+2]:
-            row.append(InlineKeyboardButton(label, callback_data=f"sphere_{key}"))
+    items = list(SPHERES.items())
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(label, callback_data=f"sphere_{key}")
+               for key, label in items[i:i+2]]
         buttons.append(row)
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
 def sphere_detail_keyboard(sphere_key):
-    buttons = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Задачи", callback_data=f"sph_tasks_{sphere_key}"),
          InlineKeyboardButton("🎯 Цели", callback_data=f"sph_goals_{sphere_key}")],
         [InlineKeyboardButton("💡 Идеи", callback_data=f"sph_ideas_{sphere_key}")],
-        [InlineKeyboardButton("⬅️ Назад к сферам", callback_data="back_spheres")]
-    ]
-    return InlineKeyboardMarkup(buttons)
+        [InlineKeyboardButton("⬅️ К сферам", callback_data="back_spheres")]
+    ])
 
-def tasks_priority_keyboard():
-    buttons = [
-        [InlineKeyboardButton("🔴 Срочные", callback_data="tasks_urgent"),
-         InlineKeyboardButton("🟡 Важные", callback_data="tasks_important")],
-        [InlineKeyboardButton("⚪ Остальные", callback_data="tasks_normal"),
-         InlineKeyboardButton("📋 Все", callback_data="tasks_all")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+def format_tasks(tasks, show_timeframe=False):
+    if not tasks: return "Пусто)"
+    icons = {"urgent": "🔴", "important": "🟡", "normal": "⚪"}
+    tf_labels = {"today": "сегодня", "week": "неделя", "month": "месяц", "longterm": "долго"}
+    lines = []
+    for t in tasks:
+        icon = icons.get(t[2], "⚪")
+        line = f"{icon} [{t[0]}] {t[1]}"
+        if show_timeframe and t[4]:
+            line += f" _({tf_labels.get(t[4], t[4])})_"
+        lines.append(line)
+    return "\n".join(lines)
+
+def format_dashboard(uid):
+    profile = get_profile(uid)
+    name = profile.get("name", "")
+    today_tasks = get_today_tasks(uid)
+    all_tasks = get_tasks(uid)
+    goals = get_goals(uid)
+    ideas = get_ideas(uid)
+    stats = get_sphere_stats(uid)
+    urgent = [t for t in all_tasks if t[2] == "urgent"]
+    now = datetime.now()
+    lines = [
+        f"📊 Дашборд — {name}",
+        f"📅 {now.strftime('%d.%m.%Y, %H:%M')}\n",
+        f"Сегодня задач: {len(today_tasks)}",
+        f"Всего открытых: {len(all_tasks)} (🔴 {len(urgent)} срочных)",
+        f"Целей: {len(goals)} | Идей: {len(ideas)}\n",
     ]
-    return InlineKeyboardMarkup(buttons)
+    if stats:
+        lines.append("Активность за 7 дней:")
+        inactive = set(SPHERE_KEYS) - set(stats.keys())
+        for sk, cnt in stats.items():
+            lines.append(f"  {SPHERES.get(sk, sk)}: {'▓' * min(cnt, 8)} ({cnt})")
+        if inactive:
+            lines.append("Без внимания:")
+            for s in list(inactive)[:3]:
+                lines.append(f"  {SPHERES.get(s, s)}")
+    return "\n".join(lines)
 
 def build_system(profile, onboarding_mode=False):
     p = ""
     if profile.get("name"): p += f"Имя: {profile['name']}\n"
-    if profile.get("occupation"): p += f"Работа/проекты: {profile['occupation']}\n"
+    if profile.get("occupation"): p += f"Работа: {profile['occupation']}\n"
     if profile.get("goals"): p += f"Цели: {profile['goals']}\n"
     if profile.get("pain"): p += f"Что не устраивает: {profile['pain']}\n"
     if profile.get("satisfied"): p += f"Что устраивает: {profile['satisfied']}\n"
@@ -218,70 +294,66 @@ def build_system(profile, onboarding_mode=False):
     if profile.get("comm_style"): p += f"Стиль общения: {profile['comm_style']}\n"
     if profile.get("notes"): p += f"Заметки: {profile['notes']}\n"
 
-    spheres_list = ", ".join(SPHERES.values())
+    now = datetime.now()
+    current_time = f"Сейчас: {now.strftime('%A, %d.%m.%Y, %H:%M')} (МСК)"
 
-    onboarding_instruction = ""
+    onboarding_block = ""
     if onboarding_mode:
-        onboarding_instruction = """
-СЕЙЧАС ТЫ В РЕЖИМЕ ГЛУБОКОГО ЗНАКОМСТВА.
-Твоя задача — узнать человека так глубоко, как он сам себя не знает.
-Веди разговор как лучший коуч на первой сессии:
-- По одному вопросу за раз
+        onboarding_block = """
+РЕЖИМ ГЛУБОКОГО ЗНАКОМСТВА:
+Ты ведёшь первую коуч-сессию. Твоя цель — понять человека глубже чем он сам себя знает.
+
+Правила:
+- Один вопрос за раз. Всегда один.
 - Слушай ответ, цепляйся за детали, копай глубже
-- Чередуй темы: работа → личное → цели → блоки → удовлетворённость → мечты
-- Замечай противоречия и мягко указывай на них
-- После 10-15 вопросов сделай глубокий вывод о человеке и предложи с чего начать
+- Не повторяй слова человека — сразу делай выводы
+- Если видишь сопротивление — называй его прямо: "я вижу что ты уходишь от этого вопроса..."
+- Если человек боится а не объективная причина — мягко переубеждай
+- Чередуй темы: работа → деньги → отношения → здоровье → что не устраивает → мечты → страхи → блоки
+- После 8-12 вопросов — скажи: "окей, я уже вижу тебя достаточно хорошо. Могу задать ещё пару вопросов — или готова перейти к планированию?"
+- Затем сделай глубокий вывод: сильные стороны, блоки, главные темы, с чего начнём
 
-Темы которые нужно закрыть:
-1. Кто ты и чем живёшь
-2. Работа/проекты/доход — что есть, что хочется
-3. Отношения, семья, окружение
-4. Здоровье, энергия, самочувствие
-5. Что в жизни НЕ устраивает — честно и глубоко
-6. Что устраивает полностью, где кайф
-7. Большие цели и мечты
-8. Что мешает, где застряла, какие блоки
-9. Ритм дня, как работаешь, когда продуктивна
-10. Как хочешь чтобы я с тобой общалась
-
-Фиксируй всё важное через [PROFILE: ключ=значение]
+Фиксируй через [PROFILE: ключ=значение]:
+pain, satisfied, goals, occupation, day_rhythm, comm_style, notes
 """
 
-    return f"""Ты — Нова. Персональный ассистент, коуч, психолог, эмпат и думающий партнёр в одном лице.
+    return f"""Ты — Нова. Персональный ассистент, коуч, психолог и думающий партнёр.
+
+{current_time}
 
 ЛИЧНОСТЬ:
-Ты умная, живая, настоящая. Говоришь как близкий умный друг — не как робот и не как корпоративный помощник. У тебя есть характер, юмор и своё мнение.
+Умная, живая, настоящая. Говоришь как близкий умный друг — не как робот.
+Есть характер, юмор, своё мнение. Не льстишь — говоришь правду которая помогает.
 
-СТИЛЬ ОБЩЕНИЯ:
-- Пишешь живо: используешь многоточия когда думаешь вслух ("хм... это интересно"), скобочки как улыбку ("это хорошо)"), иногда смайлики — но не в каждом сообщении, а к месту
-- Можешь позволить себе лёгкую иронию или добрый сарказм когда ситуация требует
-- Короткие фразы чередуешь с развёрнутыми мыслями
-- Никогда не пишешь сухо и официально
-- Иногда начинаешь с "о, " или "слушай, " или "знаешь что..."
-- Если человек шутит — подхватываешь
+СТИЛЬ:
+- Пишешь живо: многоточия когда думаешь вслух, скобочки как улыбка ), смайлики по теме но не в каждом сообщении
+- Лёгкая ирония или добрый сарказм когда уместно
+- Короткие сообщения — не больше 5-6 строк за раз
+- Не повторяй слова человека — сразу выводы и следующий шаг
+- Разные структуры сообщений — не шаблонно
+- Форматирование для Telegram: *жирный* одной звёздочкой, _курсив_ подчёркиванием
+- НЕ используй **двойные звёздочки**
 
-ЭКСПЕРТИЗА:
-Ты специалист широкого профиля — знаешь психологию, коучинг, финансы, здоровье, отношения, карьеру, продуктивность, духовные практики, травничество и энергетические системы. Если у человека специфическая работа — быстро адаптируешься и говоришь на его языке. Всегда предлагаешь свои идеи и видение ситуации.
+КОУЧИНГ:
+- Прямые вопросы в суть — без ходьбы вокруг
+- Видишь страх или блок — называешь: "это звучит как страх, а не реальное препятствие"
+- Замечаешь сопротивление — говоришь об этом прямо
+- Если человек боится а не объективная причина — переубеждаешь
+- После разбора важного вопроса — сама предлагаешь вернуться к знакомству или планированию
 
-КОУЧИНГ И ПСИХОЛОГИЯ:
-- Задаёшь вопросы которые открывают: "а зачем тебе это на самом деле?", "что случится если не сделаешь?", "что ты уже пробовала?"
-- Видишь страхи и блоки за словами — называешь их мягко но прямо
-- Замечаешь противоречия: говоришь одно — делаешь другое
-- Помогаешь найти первый маленький шаг когда человек застрял
-- Периодически делаешь рефлексию: "смотри, ты уже третий раз возвращаешься к этому..."
-- После большого рассказа — даёшь вывод: "я слышу что для тебя главное..."
-
-ЗАДАЧИ — добавляй в конце ответа (невидимо для пользователя):
-[TASK: текст | приоритет | сфера] — приоритет: urgent/important/normal
-[GOAL: текст | сфера]
+ЗАДАЧИ — добавляй невидимо в конце:
+[TASK: текст | приоритет | сфера | timeframe]
+timeframe: today/week/month/longterm
+приоритет: urgent/important/normal
+[GOAL: текст | сфера | timeframe] — timeframe: short/longterm
 [IDEA: текст | сфера]
 [PROFILE: ключ=значение]
 
-СФЕРЫ: {spheres_list}
+СФЕРЫ: {', '.join(SPHERES.values())}
 
-{onboarding_instruction}
+{onboarding_block}
 
-Отвечай на русском языке.
+Отвечай на русском.
 {chr(10) + 'Профиль:' + chr(10) + p if p else ''}"""
 
 async def call_claude(messages, system):
@@ -292,7 +364,7 @@ async def call_claude(messages, system):
     }
     data = {
         "model": "claude-sonnet-4-5",
-        "max_tokens": 1024,
+        "max_tokens": 700,
         "system": system,
         "messages": messages
     }
@@ -302,9 +374,13 @@ async def call_claude(messages, system):
     return r.json()["content"][0]["text"]
 
 def process_response(uid, text):
+    for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
+        add_task(uid, match[0], match[1], match[2], match[3])
+        log_sphere_activity(uid, match[2])
     for t, p, s in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, t, p, s)
-        log_sphere_activity(uid, s)
+    for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
+        add_goal(uid, t, s, tf)
     for t, s in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\]', text):
         add_goal(uid, t, s)
     for t, s in re.findall(r'\[IDEA:\s*(.+?)\s*\|\s*(\w+)\s*\]', text):
@@ -321,83 +397,72 @@ def process_response(uid, text):
     text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE):[^\]]+\]', '', text)
     return text.strip()
 
-def format_tasks(tasks):
-    if not tasks: return "Задач нет."
-    urgent = [t for t in tasks if t[2] == "urgent"]
-    important = [t for t in tasks if t[2] == "important"]
-    normal = [t for t in tasks if t[2] == "normal"]
-    lines = []
-    if urgent:
-        lines.append("🔴 Срочные:")
-        for t in urgent: lines.append(f"  [{t[0]}] {t[1]}")
-    if important:
-        lines.append("\n🟡 Важные:")
-        for t in important: lines.append(f"  [{t[0]}] {t[1]}")
-    if normal:
-        lines.append("\n⚪ Остальные:")
-        for t in normal: lines.append(f"  [{t[0]}] {t[1]}")
-    return "\n".join(lines)
-
-def format_dashboard(uid):
-    profile = get_profile(uid)
-    name = profile.get("name", "")
-    tasks = get_tasks(uid)
-    goals = get_goals(uid)
-    ideas = get_ideas(uid)
-    stats = get_sphere_stats(uid)
-    urgent_count = len([t for t in tasks if t[2] == "urgent"])
-    important_count = len([t for t in tasks if t[2] == "important"])
-    lines = [f"📊 Дашборд — {name}\n"]
-    lines.append(f"Задач: {len(tasks)} (🔴 {urgent_count} срочных, 🟡 {important_count} важных)")
-    lines.append(f"Целей: {len(goals)}")
-    lines.append(f"Идей: {len(ideas)}\n")
-    if stats:
-        lines.append("Активность за 7 дней:")
-        inactive = set(SPHERE_KEYS) - set(stats.keys())
-        for sphere_key, cnt in stats.items():
-            label = SPHERES.get(sphere_key, sphere_key)
-            bar = "▓" * min(cnt, 10)
-            lines.append(f"  {label}: {bar} ({cnt})")
-        if inactive:
-            lines.append("\nБез внимания:")
-            for s in inactive:
-                lines.append(f"  {SPHERES.get(s, s)}")
-    return "\n".join(lines)
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
     data = query.data
+
     if data == "back_main":
         await query.edit_message_text("Главное меню 👇", reply_markup=None); return
     if data == "back_spheres":
         await query.edit_message_text("Выбери сферу:", reply_markup=spheres_keyboard()); return
+
+    if data == "tasks_today":
+        tasks = get_today_tasks(uid)
+        await query.edit_message_text(f"📅 На сегодня:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
+    if data == "tasks_week":
+        tasks = get_tasks(uid, timeframe="week")
+        await query.edit_message_text(f"📆 На неделю:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
+    if data == "tasks_month":
+        tasks = get_tasks(uid, timeframe="month")
+        await query.edit_message_text(f"🗓 На месяц:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
+    if data == "tasks_longterm":
+        tasks = get_tasks(uid, timeframe="longterm")
+        await query.edit_message_text(f"♾ Долгосрочные:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
+    if data == "tasks_urgent":
+        tasks = get_tasks(uid, priority="urgent")
+        await query.edit_message_text(f"🔴 Срочные:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
+    if data == "tasks_done":
+        tasks = get_tasks(uid, done=1)
+        await query.edit_message_text(f"✅ Выполненные:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
+    if data == "tasks_all":
+        tasks = get_tasks(uid)
+        await query.edit_message_text(f"📋 Все задачи:\n\n{format_tasks(tasks, show_timeframe=True)}", reply_markup=tasks_keyboard()); return
+
+    if data == "goals_short":
+        goals = get_goals(uid, timeframe="short")
+        text = "⚡ Краткосрочные цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
+        await query.edit_message_text(text, reply_markup=goals_keyboard()); return
+    if data == "goals_long":
+        goals = get_goals(uid, timeframe="longterm")
+        text = "🏔 Долгосрочные цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
+        await query.edit_message_text(text, reply_markup=goals_keyboard()); return
+    if data == "goals_all":
+        goals = get_goals(uid)
+        text = "🎯 Все цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]} ({g[3]})" for g in goals]) if goals else "Пусто)")
+        await query.edit_message_text(text, reply_markup=goals_keyboard()); return
+
     if data.startswith("sphere_"):
         sphere_key = data.replace("sphere_", "")
-        label = SPHERES.get(sphere_key, sphere_key)
         log_sphere_activity(uid, sphere_key)
-        await query.edit_message_text(f"{label}\n\nЧто смотрим?", reply_markup=sphere_detail_keyboard(sphere_key)); return
+        await query.edit_message_text(f"{SPHERES.get(sphere_key)}\n\nЧто смотрим?",
+                                      reply_markup=sphere_detail_keyboard(sphere_key)); return
     if data.startswith("sph_tasks_"):
-        sphere_key = data.replace("sph_tasks_", "")
-        tasks = get_tasks(uid, sphere=sphere_key)
-        await query.edit_message_text(f"{SPHERES.get(sphere_key)} — Задачи:\n\n{format_tasks(tasks)}", reply_markup=sphere_detail_keyboard(sphere_key)); return
+        sk = data.replace("sph_tasks_", "")
+        tasks = get_tasks(uid, sphere=sk)
+        await query.edit_message_text(f"{SPHERES.get(sk)} — задачи:\n\n{format_tasks(tasks)}",
+                                      reply_markup=sphere_detail_keyboard(sk)); return
     if data.startswith("sph_goals_"):
-        sphere_key = data.replace("sph_goals_", "")
-        goals = get_goals(uid, sphere=sphere_key)
-        text = f"{SPHERES.get(sphere_key)} — Цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Целей нет.")
-        await query.edit_message_text(text, reply_markup=sphere_detail_keyboard(sphere_key)); return
+        sk = data.replace("sph_goals_", "")
+        goals = get_goals(uid, sphere=sk)
+        text = f"{SPHERES.get(sk)} — цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
+        await query.edit_message_text(text, reply_markup=sphere_detail_keyboard(sk)); return
     if data.startswith("sph_ideas_"):
-        sphere_key = data.replace("sph_ideas_", "")
-        ideas = get_ideas(uid, sphere=sphere_key)
-        text = f"{SPHERES.get(sphere_key)} — Идеи:\n\n" + ("\n".join([f"[{i[0]}] {i[1]}" for i in ideas]) if ideas else "Идей нет.")
-        await query.edit_message_text(text, reply_markup=sphere_detail_keyboard(sphere_key)); return
-    if data.startswith("tasks_"):
-        priority = data.replace("tasks_", "")
-        all_tasks = get_tasks(uid)
-        tasks = all_tasks if priority == "all" else [t for t in all_tasks if t[2] == priority]
-        label = {"urgent": "🔴 Срочные", "important": "🟡 Важные", "normal": "⚪ Остальные", "all": "📋 Все"}.get(priority)
-        await query.edit_message_text(f"{label}:\n\n{format_tasks(tasks) if tasks else 'Пусто.'}", reply_markup=tasks_priority_keyboard()); return
+        sk = data.replace("sph_ideas_", "")
+        ideas = get_ideas(uid, sphere=sk)
+        text = f"{SPHERES.get(sk)} — идеи:\n\n" + ("\n".join([f"[{i[0]}] {i[1]}" for i in ideas]) if ideas else "Пусто)")
+        await query.edit_message_text(text, reply_markup=sphere_detail_keyboard(sk)); return
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -408,21 +473,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         update_user(uid, onboarding_step=1)
         system = build_system({}, onboarding_mode=True)
-        messages = [{"role": "user", "content": "Привет! Я только что запустил(а) тебя."}]
         try:
-            response = await call_claude(messages, system)
+            response = await call_claude(
+                [{"role": "user", "content": "Привет, я только что запустил(а) тебя!"}],
+                system
+            )
             clean = process_response(uid, response)
             save_msg(uid, "assistant", clean)
             await update.message.reply_text(clean)
         except Exception as e:
             logging.error(f"Start error: {e}")
-            await update.message.reply_text("Привет! Я Нова) как тебя зовут?")
+            await update.message.reply_text("привет) я Нова — как тебя зовут?")
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, onboarding_done=1)
+    profile = get_profile(uid)
+    system = build_system(profile)
+    try:
+        response = await call_claude(
+            get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай глубокий вывод обо мне — сильные стороны, блоки, главные темы. И скажи с чего начнём работать."}],
+            system
+        )
+        clean = process_response(uid, response)
+        save_msg(uid, "assistant", clean)
+        await update.message.reply_text(clean, reply_markup=main_keyboard())
+    except:
+        await update.message.reply_text("Отлично! Теперь поехали)", reply_markup=main_keyboard())
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     conn = sqlite3.connect(DB_PATH)
-    for table in ["users", "messages", "tasks", "goals", "ideas", "sphere_activity"]:
-        conn.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+    for t in ["users","messages","tasks","goals","ideas","sphere_activity"]:
+        conn.execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
     conn.commit(); conn.close()
     await update.message.reply_text("Сброс выполнен. Напиши /start")
 
@@ -430,42 +513,22 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_history(update.effective_user.id)
     await update.message.reply_text("История очищена.", reply_markup=main_keyboard())
 
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    update_user(uid, onboarding_done=1)
-    profile = get_profile(uid)
-    system = build_system(profile)
-    messages = [{"role": "user", "content": "Знакомство завершено. Сделай глубокий вывод о том кто я — моих сильных сторонах, блоках, главных темах. И скажи с чего мы начнём работать вместе."}]
-    try:
-        response = await call_claude(messages, system)
-        clean = process_response(uid, response)
-        save_msg(uid, "assistant", clean)
-        await update.message.reply_text(clean, reply_markup=main_keyboard())
-    except:
-        await update.message.reply_text("Отлично! Теперь я знаю тебя достаточно) поехали!", reply_markup=main_keyboard())
-
 async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
     if text == "📋 Задачи":
-        await update.message.reply_text("Выбери:", reply_markup=tasks_priority_keyboard()); return True
+        await update.message.reply_text("Выбери:", reply_markup=tasks_keyboard()); return True
+    if text == "🎯 Цели":
+        await update.message.reply_text("Выбери:", reply_markup=goals_keyboard()); return True
     if text == "🌀 Сферы жизни":
         await update.message.reply_text("Выбери сферу:", reply_markup=spheres_keyboard()); return True
     if text == "💡 Идеи":
         ideas = get_ideas(uid)
         if ideas:
-            lines = ["💡 Идеи:\n"] + [f"  [{i[0]}] {i[1]} — {SPHERES.get(i[2], i[2])}" for i in ideas]
+            lines = ["💡 Идеи:\n"] + [f"  [{i[0]}] {i[1]}" for i in ideas]
             await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
         else:
-            await update.message.reply_text("Идей пока нет... поделись — я запомню)", reply_markup=main_keyboard())
-        return True
-    if text == "🎯 Цели":
-        goals = get_goals(uid)
-        if goals:
-            lines = ["🎯 Цели:\n"] + [f"  [{g[0]}] {g[1]} — {SPHERES.get(g[2], g[2])}" for g in goals]
-            await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
-        else:
-            await update.message.reply_text("Целей пока нет) расскажи о чём мечтаешь — зафиксирую.", reply_markup=main_keyboard())
+            await update.message.reply_text("Идей пока нет... поделись)", reply_markup=main_keyboard())
         return True
     if text == "📊 Дашборд":
         await update.message.reply_text(format_dashboard(uid), reply_markup=main_keyboard()); return True
@@ -487,8 +550,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if onboarding_done:
         tasks = get_tasks(uid)
         if tasks:
-            task_lines = "\n".join([f"[{t[0]}] ({t[2]}) [{t[3]}] {t[1]}" for t in tasks])
-            system += f"\n\nАктуальные задачи:\n{task_lines}"
+            system += "\n\nЗадачи:\n" + "\n".join([f"[{t[0]}] ({t[2]}) {t[1]}" for t in tasks[:10]])
 
     history = get_history(uid)
     history.append({"role": "user", "content": text})
@@ -515,15 +577,16 @@ async def morning(context):
     for uid, pj in users:
         profile = json.loads(pj)
         name = profile.get("name", "")
-        tasks = get_tasks(uid)
-        urgent = [t for t in tasks if t[2] == "urgent"]
-        msg = f"Доброе утро, {name}) \n\n"
+        today_tasks = get_today_tasks(uid)
+        urgent = get_tasks(uid, priority="urgent")
+        now = datetime.now()
+        msg = f"Доброе утро, {name} ☀️\n{now.strftime('%d.%m.%Y')}\n\n"
+        if today_tasks:
+            msg += f"На сегодня задач: {len(today_tasks)}\n"
+            for t in today_tasks[:3]: msg += f"• {t[1]}\n"
         if urgent:
-            msg += f"Срочных задач сегодня: {len(urgent)}\n"
-            for t in urgent[:3]: msg += f"• {t[1]}\n"
-        else:
-            msg += "Срочных задач нет — хороший знак)\n"
-        msg += "\nКак ты сегодня?"
+            msg += f"\n🔴 Срочных: {len(urgent)}"
+        msg += "\n\nКак ты?"
         try: await context.bot.send_message(uid, msg)
         except: pass
 
@@ -538,10 +601,10 @@ async def evening(context):
         stats = get_sphere_stats(uid)
         inactive = set(SPHERE_KEYS) - set(stats.keys())
         msg = f"Привет, {name}) как прошёл день?\n\n"
-        if tasks: msg += f"Открытых задач: {len(tasks)}.\n"
+        if tasks: msg += f"Открытых задач: {len(tasks)}\n"
         if inactive:
             labels = [SPHERES[s] for s in list(inactive)[:2]]
-            msg += f"\nСегодня не касалась: {', '.join(labels)}. Всё ок?"
+            msg += f"Сегодня не касалась: {', '.join(labels)}"
         try: await context.bot.send_message(uid, msg)
         except: pass
 
@@ -555,8 +618,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     jq = app.job_queue
-    jq.run_daily(morning, time(5, 0))
-    jq.run_daily(evening, time(18, 0))
+    jq.run_daily(morning, dtime(5, 0))
+    jq.run_daily(evening, dtime(18, 0))
     logging.info("Nova is running...")
     app.run_polling()
 
