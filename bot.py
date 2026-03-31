@@ -16,7 +16,7 @@ TURSO_URL = os.environ.get("TURSO_URL")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://nova-bot-production.up.railway.app")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://assistant-bot-production-6438.up.railway.app")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -206,11 +206,11 @@ def get_sphere_stats(uid):
 
 # Google Calendar functions
 def save_google_token(uid, creds):
-    db_exec("""INSERT OR REPLACE INTO google_tokens 
+    db_exec("""INSERT OR REPLACE INTO google_tokens
                (user_id, token, refresh_token, token_uri, client_id, client_secret, scopes)
                VALUES (?,?,?,?,?,?,?)""",
             (uid, creds.token, creds.refresh_token, creds.token_uri,
-             creds.client_id, creds.client_secret, json.dumps(creds.scopes)))
+             creds.client_id, creds.client_secret, json.dumps(list(creds.scopes))))
 
 def get_google_token(uid):
     row = db_fetchone("SELECT * FROM google_tokens WHERE user_id=?", (uid,))
@@ -235,18 +235,16 @@ def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
     service = get_calendar_service(uid)
     if not service: return False
     try:
+        from datetime import timedelta
         now = datetime.now()
         if due_date:
             start_date = due_date
         elif timeframe == "today":
             start_date = now.date().isoformat()
         elif timeframe == "week":
-            from datetime import timedelta
             start_date = (now + timedelta(days=3)).date().isoformat()
         else:
-            from datetime import timedelta
             start_date = (now + timedelta(days=7)).date().isoformat()
-
         event = {
             "summary": task_text,
             "start": {"date": start_date},
@@ -259,19 +257,24 @@ def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
         return False
 
 def get_oauth_flow():
-    return Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [f"{WEBHOOK_URL}/oauth/callback"]
-            }
-        },
+    # ВАЖНО: используем без PKCE чтобы избежать "Missing code verifier"
+    import os
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [f"{WEBHOOK_URL}/oauth/callback"]
+        }
+    }
+    flow = Flow.from_client_config(
+        client_config,
         scopes=SCOPES,
         redirect_uri=f"{WEBHOOK_URL}/oauth/callback"
     )
+    return flow
 
 SPHERES = {
     "work": "💼 Работа & Карьера",
@@ -494,7 +497,7 @@ def build_system(profile, onboarding_mode=False):
 - *жирный* для важного
 - _курсив_ для акцентов
 - Смайлики уместно, не в каждой строке
-- Максимум 4 строки в сообщении
+- СТРОГО максимум 4 строки в сообщении. Никогда больше.
 - Без вступлений, сразу по делу
 - Списки через • когда нужно перечислить
 
@@ -728,7 +731,9 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     existing = get_google_token(uid)
     if existing:
-        await update.message.reply_text("✅ Google Календарь уже подключён!\n\nВсе новые задачи автоматически попадают в календарь.", reply_markup=main_keyboard())
+        await update.message.reply_text(
+            "✅ Google Календарь уже подключён!\n\nВсе новые задачи автоматически попадают в календарь.",
+            reply_markup=main_keyboard())
         return
     try:
         flow = get_oauth_flow()
@@ -1048,11 +1053,17 @@ async def oauth_callback(request):
     code = request.rel_url.query.get("code")
     state = request.rel_url.query.get("state")
     if not code or not state:
-        return web.Response(text="Ошибка авторизации")
+        return web.Response(text="Ошибка авторизации — нет кода или state")
     try:
         uid = int(state)
         flow = get_oauth_flow()
-        flow.fetch_token(code=code)
+        # Отключаем проверку PKCE code_verifier
+        flow.oauth2session.fetch_token(
+            token_url="https://oauth2.googleapis.com/token",
+            code=code,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            include_client_id=True,
+        )
         creds = flow.credentials
         save_google_token(uid, creds)
         await request.app["bot"].send_message(
@@ -1062,7 +1073,7 @@ async def oauth_callback(request):
         return web.Response(text="✅ Готово! Можешь закрыть эту вкладку и вернуться в Telegram.")
     except Exception as e:
         logging.error(f"OAuth callback error: {e}")
-        return web.Response(text="Что-то пошло не так. Попробуй ещё раз.")
+        return web.Response(text=f"Что-то пошло не так: {e}")
 
 def main():
     init_db()
@@ -1090,7 +1101,6 @@ def main():
     jq.run_daily(evening, dtime(18, 0))
     jq.run_daily(weekly_review, dtime(9, 0), days=(6,))
 
-    # Web server for OAuth callback
     async def start_web(app_obj):
         web_app = web.Application()
         web_app["bot"] = app_obj.bot
