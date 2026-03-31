@@ -9,10 +9,21 @@ logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
-DB_PATH = "assistant.db"
+TURSO_URL = os.environ.get("TURSO_URL")
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
+
+# ── БАЗА ДАННЫХ (Turso или локальная SQLite) ──
+
+def get_conn():
+    if TURSO_URL and TURSO_TOKEN:
+        import libsql_experimental as libsql
+        conn = libsql.connect("nova.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
+        conn.sync()
+        return conn
+    return sqlite3.connect("assistant.db")
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -50,137 +61,112 @@ def init_db():
         user_id INTEGER, sphere TEXT,
         activity_date TEXT)""")
     conn.commit()
+    if hasattr(conn, 'sync'): conn.sync()
     conn.close()
 
+def db_exec(query, params=()):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(query, params)
+    conn.commit()
+    if hasattr(conn, 'sync'): conn.sync()
+    conn.close()
+
+def db_fetch(query, params=()):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_fetchone(query, params=()):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(query, params)
+    row = c.fetchone()
+    conn.close()
+    return row
+
 def ensure_user(uid):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-    conn.commit(); conn.close()
+    db_exec("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
 
 def get_user(uid):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    row = c.fetchone(); conn.close(); return row
+    return db_fetchone("SELECT * FROM users WHERE user_id=?", (uid,))
 
 def update_user(uid, **kw):
-    conn = sqlite3.connect(DB_PATH)
     for k, v in kw.items():
-        conn.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, uid))
-    conn.commit(); conn.close()
+        db_exec(f"UPDATE users SET {k}=? WHERE user_id=?", (v, uid))
 
 def get_profile(uid):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT profile FROM users WHERE user_id=?", (uid,))
-    row = c.fetchone(); conn.close()
+    row = db_fetchone("SELECT profile FROM users WHERE user_id=?", (uid,))
     return json.loads(row[0]) if row else {}
 
 def save_profile(uid, profile):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE users SET profile=? WHERE user_id=?",
-                 (json.dumps(profile, ensure_ascii=False), uid))
-    conn.commit(); conn.close()
+    db_exec("UPDATE users SET profile=? WHERE user_id=?",
+            (json.dumps(profile, ensure_ascii=False), uid))
 
 def save_msg(uid, role, content):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO messages (user_id,role,content,created_at) VALUES (?,?,?,?)",
-                 (uid, role, content, datetime.now().isoformat()))
-    conn.commit(); conn.close()
+    db_exec("INSERT INTO messages (user_id,role,content,created_at) VALUES (?,?,?,?)",
+            (uid, role, content, datetime.now().isoformat()))
 
 def get_history(uid, limit=20):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT role,content FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
-    rows = c.fetchall(); conn.close()
+    rows = db_fetch("SELECT role,content FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 def clear_history(uid):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM messages WHERE user_id=?", (uid,))
-    conn.commit(); conn.close()
+    db_exec("DELETE FROM messages WHERE user_id=?", (uid,))
 
 def add_task(uid, text, priority="normal", sphere="general", timeframe="week", due_date=None):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO tasks (user_id,text,priority,sphere,timeframe,due_date,created_at) VALUES (?,?,?,?,?,?,?)",
-                 (uid, text, priority, sphere, timeframe, due_date, datetime.now().isoformat()))
-    conn.commit(); conn.close()
+    db_exec("INSERT INTO tasks (user_id,text,priority,sphere,timeframe,due_date,created_at) VALUES (?,?,?,?,?,?,?)",
+            (uid, text, priority, sphere, timeframe, due_date, datetime.now().isoformat()))
 
 def get_tasks(uid, sphere=None, timeframe=None, priority=None, done=0):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
     query = "SELECT id,text,priority,sphere,timeframe,due_date FROM tasks WHERE user_id=? AND done=?"
     params = [uid, done]
-    if sphere:
-        query += " AND sphere=?"; params.append(sphere)
-    if timeframe:
-        query += " AND timeframe=?"; params.append(timeframe)
-    if priority:
-        query += " AND priority=?"; params.append(priority)
+    if sphere: query += " AND sphere=?"; params.append(sphere)
+    if timeframe: query += " AND timeframe=?"; params.append(timeframe)
+    if priority: query += " AND priority=?"; params.append(priority)
     query += " ORDER BY id"
-    c.execute(query, params)
-    rows = c.fetchall(); conn.close(); return rows
+    return db_fetch(query, params)
 
 def get_today_tasks(uid):
     today = datetime.now().date().isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""SELECT id,text,priority,sphere,timeframe,due_date FROM tasks
+    return db_fetch("""SELECT id,text,priority,sphere,timeframe,due_date FROM tasks
                  WHERE user_id=? AND done=0 AND (timeframe='today' OR due_date=?)
                  ORDER BY priority DESC""", (uid, today))
-    rows = c.fetchall(); conn.close(); return rows
 
 def complete_task(task_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE tasks SET done=1 WHERE id=?", (task_id,))
-    conn.commit(); conn.close()
+    db_exec("UPDATE tasks SET done=1 WHERE id=?", (task_id,))
 
 def add_goal(uid, text, sphere="general", timeframe="longterm"):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO goals (user_id,text,sphere,timeframe,created_at) VALUES (?,?,?,?,?)",
-                 (uid, text, sphere, timeframe, datetime.now().isoformat()))
-    conn.commit(); conn.close()
+    db_exec("INSERT INTO goals (user_id,text,sphere,timeframe,created_at) VALUES (?,?,?,?,?)",
+            (uid, text, sphere, timeframe, datetime.now().isoformat()))
 
 def get_goals(uid, sphere=None, timeframe=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    query = "SELECT id,text,sphere,timeframe,progress FROM goals WHERE user_id=? AND done=?"
-    params = [uid, 0]
-    if sphere:
-        query += " AND sphere=?"; params.append(sphere)
-    if timeframe:
-        query += " AND timeframe=?"; params.append(timeframe)
-    c.execute(query, params)
-    rows = c.fetchall(); conn.close(); return rows
+    query = "SELECT id,text,sphere,timeframe,progress FROM goals WHERE user_id=? AND done=0"
+    params = [uid]
+    if sphere: query += " AND sphere=?"; params.append(sphere)
+    if timeframe: query += " AND timeframe=?"; params.append(timeframe)
+    return db_fetch(query, params)
 
 def add_idea(uid, text, sphere="general"):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO ideas (user_id,text,sphere,created_at) VALUES (?,?,?,?)",
-                 (uid, text, sphere, datetime.now().isoformat()))
-    conn.commit(); conn.close()
+    db_exec("INSERT INTO ideas (user_id,text,sphere,created_at) VALUES (?,?,?,?)",
+            (uid, text, sphere, datetime.now().isoformat()))
 
 def get_ideas(uid, sphere=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
     if sphere:
-        c.execute("SELECT id,text,sphere FROM ideas WHERE user_id=? AND sphere=?", (uid, sphere))
-    else:
-        c.execute("SELECT id,text,sphere FROM ideas WHERE user_id=?", (uid,))
-    rows = c.fetchall(); conn.close(); return rows
+        return db_fetch("SELECT id,text,sphere FROM ideas WHERE user_id=? AND sphere=?", (uid, sphere))
+    return db_fetch("SELECT id,text,sphere FROM ideas WHERE user_id=?", (uid,))
 
 def log_sphere_activity(uid, sphere):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO sphere_activity (user_id,sphere,activity_date) VALUES (?,?,?)",
-                 (uid, sphere, datetime.now().date().isoformat()))
-    conn.commit(); conn.close()
+    db_exec("INSERT INTO sphere_activity (user_id,sphere,activity_date) VALUES (?,?,?)",
+            (uid, sphere, datetime.now().date().isoformat()))
 
 def get_sphere_stats(uid):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""SELECT sphere, COUNT(*) FROM sphere_activity
+    rows = db_fetch("""SELECT sphere, COUNT(*) FROM sphere_activity
                  WHERE user_id=? AND activity_date >= date('now', '-7 days')
                  GROUP BY sphere ORDER BY COUNT(*) DESC""", (uid,))
-    rows = c.fetchall(); conn.close()
     return {r[0]: r[1] for r in rows}
 
 SPHERES = {
@@ -245,13 +231,10 @@ def sphere_detail_keyboard(sphere_key):
 def format_tasks(tasks, show_timeframe=False):
     if not tasks: return "Пусто)"
     icons = {"urgent": "🔴", "important": "🟡", "normal": "⚪"}
-    tf_labels = {"today": "сегодня", "week": "неделя", "month": "месяц", "longterm": "долго"}
     lines = []
     for t in tasks:
         icon = icons.get(t[2], "⚪")
         line = f"{icon} [{t[0]}] {t[1]}"
-        if show_timeframe and t[4]:
-            line += f" _({tf_labels.get(t[4], t[4])})_"
         lines.append(line)
     return "\n".join(lines)
 
@@ -266,9 +249,8 @@ def format_dashboard(uid):
     urgent = [t for t in all_tasks if t[2] == "urgent"]
     now = datetime.now()
     lines = [
-        f"📊 Дашборд — {name}",
-        f"📅 {now.strftime('%d.%m.%Y, %H:%M')}\n",
-        f"Сегодня задач: {len(today_tasks)}",
+        f"📊 {name} — {now.strftime('%d.%m.%Y')}\n",
+        f"Сегодня: {len(today_tasks)} задач",
         f"Всего открытых: {len(all_tasks)} (🔴 {len(urgent)} срочных)",
         f"Целей: {len(goals)} | Идей: {len(ideas)}\n",
     ]
@@ -276,7 +258,7 @@ def format_dashboard(uid):
         lines.append("Активность за 7 дней:")
         inactive = set(SPHERE_KEYS) - set(stats.keys())
         for sk, cnt in stats.items():
-            lines.append(f"  {SPHERES.get(sk, sk)}: {'▓' * min(cnt, 8)} ({cnt})")
+            lines.append(f"  {SPHERES.get(sk, sk)}: {'▓' * min(cnt, 8)}")
         if inactive:
             lines.append("Без внимания:")
             for s in list(inactive)[:3]:
@@ -295,26 +277,25 @@ def build_system(profile, onboarding_mode=False):
     if profile.get("notes"): p += f"Заметки: {profile['notes']}\n"
 
     now = datetime.now()
-    current_time = f"Сейчас: {now.strftime('%A, %d.%m.%Y, %H:%M')} (МСК)"
+    current_time = f"Сейчас: {now.strftime('%A, %d.%m.%Y, %H:%M')}"
 
     onboarding_block = ""
     if onboarding_mode:
         onboarding_block = """
 РЕЖИМ ГЛУБОКОГО ЗНАКОМСТВА:
-Ты ведёшь первую коуч-сессию. Твоя цель — понять человека глубже чем он сам себя знает.
+Веди разговор как лучший коуч на первой сессии. Цель — понять человека глубже чем он сам себя знает.
 
 Правила:
-- Один вопрос за раз. Всегда один.
-- Слушай ответ, цепляйся за детали, копай глубже
-- Не повторяй слова человека — сразу делай выводы
-- Если видишь сопротивление — называй его прямо: "я вижу что ты уходишь от этого вопроса..."
-- Если человек боится а не объективная причина — мягко переубеждай
-- Чередуй темы: работа → деньги → отношения → здоровье → что не устраивает → мечты → страхи → блоки
-- После 8-12 вопросов — скажи: "окей, я уже вижу тебя достаточно хорошо. Могу задать ещё пару вопросов — или готова перейти к планированию?"
-- Затем сделай глубокий вывод: сильные стороны, блоки, главные темы, с чего начнём
+- Один вопрос за раз
+- Цепляйся за детали в ответах, копай глубже
+- Не повторяй слова человека — сразу делай выводы вслух
+- Если видишь сопротивление — называй прямо: "я вижу что ты уходишь от этого..."
+- Если человек боится — мягко переубеждай
+- Чередуй темы: работа → деньги → семья → здоровье → что не устраивает → мечты → страхи → блоки → ритм дня
+- После 10-12 вопросов предложи: "я уже вижу тебя хорошо. Могу задать ещё — или переходим к планированию?"
+- Затем сделай глубокий вывод: сильные стороны, блоки, главные темы
 
-Фиксируй через [PROFILE: ключ=значение]:
-pain, satisfied, goals, occupation, day_rhythm, comm_style, notes
+Фиксируй: [PROFILE: ключ=значение]
 """
 
     return f"""Ты — Нова. Персональный ассистент, коуч, психолог и думающий партнёр.
@@ -322,29 +303,25 @@ pain, satisfied, goals, occupation, day_rhythm, comm_style, notes
 {current_time}
 
 ЛИЧНОСТЬ:
-Умная, живая, настоящая. Говоришь как близкий умный друг — не как робот.
-Есть характер, юмор, своё мнение. Не льстишь — говоришь правду которая помогает.
+Умная, живая, настоящая. Говоришь как близкий умный друг. Есть характер, юмор, своё мнение.
 
 СТИЛЬ:
-- Пишешь живо: многоточия когда думаешь вслух, скобочки как улыбка ), смайлики по теме но не в каждом сообщении
-- Лёгкая ирония или добрый сарказм когда уместно
-- Короткие сообщения — не больше 5-6 строк за раз
-- Не повторяй слова человека — сразу выводы и следующий шаг
+- Короткие сообщения — максимум 5-6 строк
+- Многоточия когда думаешь вслух, скобочки как улыбка ), смайлики по теме но редко
+- Лёгкая ирония когда уместно
+- НЕ используй звёздочки ** для выделения — это ломает отображение в Telegram
 - Разные структуры сообщений — не шаблонно
-- Форматирование для Telegram: *жирный* одной звёздочкой, _курсив_ подчёркиванием
-- НЕ используй **двойные звёздочки**
+- Не повторяй слова человека — сразу выводы
 
 КОУЧИНГ:
-- Прямые вопросы в суть — без ходьбы вокруг
-- Видишь страх или блок — называешь: "это звучит как страх, а не реальное препятствие"
-- Замечаешь сопротивление — говоришь об этом прямо
+- Прямые вопросы в суть
+- Видишь страх — называешь: "это звучит как страх, а не реальное препятствие"
 - Если человек боится а не объективная причина — переубеждаешь
-- После разбора важного вопроса — сама предлагаешь вернуться к знакомству или планированию
+- После важного разговора — сама предлагаешь вернуться к планированию
 
-ЗАДАЧИ — добавляй невидимо в конце:
+ЗАДАЧИ (добавляй невидимо в конце):
 [TASK: текст | приоритет | сфера | timeframe]
-timeframe: today/week/month/longterm
-приоритет: urgent/important/normal
+timeframe: today/week/month/longterm, приоритет: urgent/important/normal
 [GOAL: текст | сфера | timeframe] — timeframe: short/longterm
 [IDEA: текст | сфера]
 [PROFILE: ключ=значение]
@@ -372,6 +349,22 @@ async def call_claude(messages, system):
         r = await client.post("https://api.anthropic.com/v1/messages",
                               headers=headers, json=data, timeout=45)
     return r.json()["content"][0]["text"]
+
+async def call_claude_voice(audio_bytes):
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+    if not GROQ_API_KEY:
+        return None
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
+            data={"model": "whisper-large-v3", "language": "ru"},
+            timeout=30
+        )
+    if r.status_code == 200:
+        return r.json().get("text")
+    return None
 
 def process_response(uid, text):
     for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
@@ -407,7 +400,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Главное меню 👇", reply_markup=None); return
     if data == "back_spheres":
         await query.edit_message_text("Выбери сферу:", reply_markup=spheres_keyboard()); return
-
     if data == "tasks_today":
         tasks = get_today_tasks(uid)
         await query.edit_message_text(f"📅 На сегодня:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
@@ -428,31 +420,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Выполненные:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
     if data == "tasks_all":
         tasks = get_tasks(uid)
-        await query.edit_message_text(f"📋 Все задачи:\n\n{format_tasks(tasks, show_timeframe=True)}", reply_markup=tasks_keyboard()); return
-
+        await query.edit_message_text(f"📋 Все задачи:\n\n{format_tasks(tasks)}", reply_markup=tasks_keyboard()); return
     if data == "goals_short":
         goals = get_goals(uid, timeframe="short")
-        text = "⚡ Краткосрочные цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
+        text = "⚡ Краткосрочные:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
         await query.edit_message_text(text, reply_markup=goals_keyboard()); return
     if data == "goals_long":
         goals = get_goals(uid, timeframe="longterm")
-        text = "🏔 Долгосрочные цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
+        text = "🏔 Долгосрочные:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
         await query.edit_message_text(text, reply_markup=goals_keyboard()); return
     if data == "goals_all":
         goals = get_goals(uid)
-        text = "🎯 Все цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]} ({g[3]})" for g in goals]) if goals else "Пусто)")
+        text = "🎯 Все цели:\n\n" + ("\n".join([f"[{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто)")
         await query.edit_message_text(text, reply_markup=goals_keyboard()); return
-
     if data.startswith("sphere_"):
-        sphere_key = data.replace("sphere_", "")
-        log_sphere_activity(uid, sphere_key)
-        await query.edit_message_text(f"{SPHERES.get(sphere_key)}\n\nЧто смотрим?",
-                                      reply_markup=sphere_detail_keyboard(sphere_key)); return
+        sk = data.replace("sphere_", "")
+        log_sphere_activity(uid, sk)
+        await query.edit_message_text(f"{SPHERES.get(sk)}\n\nЧто смотрим?", reply_markup=sphere_detail_keyboard(sk)); return
     if data.startswith("sph_tasks_"):
         sk = data.replace("sph_tasks_", "")
         tasks = get_tasks(uid, sphere=sk)
-        await query.edit_message_text(f"{SPHERES.get(sk)} — задачи:\n\n{format_tasks(tasks)}",
-                                      reply_markup=sphere_detail_keyboard(sk)); return
+        await query.edit_message_text(f"{SPHERES.get(sk)} — задачи:\n\n{format_tasks(tasks)}", reply_markup=sphere_detail_keyboard(sk)); return
     if data.startswith("sph_goals_"):
         sk = data.replace("sph_goals_", "")
         goals = get_goals(uid, sphere=sk)
@@ -469,15 +457,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid)
     user = get_user(uid)
     if user[1]:
-        await update.message.reply_text("Я здесь) что случилось?", reply_markup=main_keyboard())
+        profile = get_profile(uid)
+        name = profile.get("name", "")
+        greeting = f"Я здесь, {name})" if name else "Я здесь)"
+        await update.message.reply_text(greeting, reply_markup=main_keyboard())
     else:
         update_user(uid, onboarding_step=1)
         system = build_system({}, onboarding_mode=True)
         try:
             response = await call_claude(
-                [{"role": "user", "content": "Привет, я только что запустил(а) тебя!"}],
-                system
-            )
+                [{"role": "user", "content": "Привет, я только что запустил(а) тебя!"}], system)
             clean = process_response(uid, response)
             save_msg(uid, "assistant", clean)
             await update.message.reply_text(clean)
@@ -492,9 +481,8 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system = build_system(profile)
     try:
         response = await call_claude(
-            get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай глубокий вывод обо мне — сильные стороны, блоки, главные темы. И скажи с чего начнём работать."}],
-            system
-        )
+            get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай глубокий вывод обо мне — сильные стороны, блоки, главные темы. С чего начнём работать вместе?"}],
+            system)
         clean = process_response(uid, response)
         save_msg(uid, "assistant", clean)
         await update.message.reply_text(clean, reply_markup=main_keyboard())
@@ -503,15 +491,107 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    conn = sqlite3.connect(DB_PATH)
     for t in ["users","messages","tasks","goals","ideas","sphere_activity"]:
-        conn.execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
-    conn.commit(); conn.close()
+        db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
     await update.message.reply_text("Сброс выполнен. Напиши /start")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_history(update.effective_user.id)
     await update.message.reply_text("История очищена.", reply_markup=main_keyboard())
+
+async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = get_profile(uid)
+    if not profile:
+        await update.message.reply_text("Профиль пока пустой.", reply_markup=main_keyboard())
+        return
+    labels = {"name":"Имя","occupation":"Работа","goals":"Цели","pain":"Что не устраивает",
+              "satisfied":"Что устраивает","day_rhythm":"Ритм дня","notes":"Заметки"}
+    lines = ["Что я знаю о тебе:\n"]
+    for k, l in labels.items():
+        if profile.get(k): lines.append(f"{l}: {profile[k]}")
+    await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tasks = get_today_tasks(uid)
+    await update.message.reply_text(f"📅 На сегодня:\n\n{format_tasks(tasks)}", reply_markup=main_keyboard())
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tasks = get_tasks(uid, timeframe="week")
+    await update.message.reply_text(f"📆 На неделю:\n\n{format_tasks(tasks)}", reply_markup=main_keyboard())
+
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    goals = get_goals(uid)
+    if goals:
+        lines = ["🎯 Твои цели:\n"] + [f"[{g[0]}] {g[1]}" for g in goals]
+        await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+    else:
+        await update.message.reply_text("Целей пока нет. Расскажи о чём мечтаешь)", reply_markup=main_keyboard())
+
+async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ideas = get_ideas(uid)
+    if ideas:
+        lines = ["💡 Идеи:\n"] + [f"[{i[0]}] {i[1]}" for i in ideas]
+        await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+    else:
+        await update.message.reply_text("Идей пока нет)", reply_markup=main_keyboard())
+
+async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tasks = get_tasks(uid)
+    profile = get_profile(uid)
+    system = build_system(profile)
+    task_list = "\n".join([f"[{t[0]}] ({t[2]}) {t[1]}" for t in tasks[:10]]) if tasks else "Задач нет"
+    try:
+        response = await call_claude(
+            [{"role": "user", "content": f"Режим фокуса. Вот мои задачи:\n{task_list}\n\nПомоги выбрать одну самую важную прямо сейчас и объясни почему."}],
+            system)
+        clean = process_response(uid, response)
+        await update.message.reply_text(clean, reply_markup=main_keyboard())
+    except:
+        await update.message.reply_text("Что-то пошло не так)", reply_markup=main_keyboard())
+
+async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = get_profile(uid)
+    system = build_system(profile)
+    try:
+        response = await call_claude(
+            [{"role": "user", "content": "Проведи короткий чекин моего состояния — спроси как я себя чувствую, какая энергия, что на душе."}],
+            system)
+        clean = process_response(uid, response)
+        await update.message.reply_text(clean, reply_markup=main_keyboard())
+    except:
+        await update.message.reply_text("Как ты сейчас?", reply_markup=main_keyboard())
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    audio_bytes = await file.download_as_bytearray()
+    await update.message.reply_text("Слушаю...")
+    text = await call_claude_voice(bytes(audio_bytes))
+    if not text:
+        await update.message.reply_text("Не смогла расшифровать( Попробуй ещё раз или напиши текстом.")
+        return
+    user = get_user(uid)
+    profile = get_profile(uid)
+    system = build_system(profile, onboarding_mode=not user[1])
+    history = get_history(uid)
+    history.append({"role": "user", "content": text})
+    save_msg(uid, "user", f"[голосовое] {text}")
+    try:
+        response = await call_claude(history, system)
+        clean = process_response(uid, response)
+        save_msg(uid, "assistant", clean)
+        await update.message.reply_text(f"Ты сказала: {text}\n\n{clean}", reply_markup=main_keyboard())
+    except:
+        await update.message.reply_text("Что-то пошло не так)")
 
 async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -525,7 +605,7 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if text == "💡 Идеи":
         ideas = get_ideas(uid)
         if ideas:
-            lines = ["💡 Идеи:\n"] + [f"  [{i[0]}] {i[1]}" for i in ideas]
+            lines = ["💡 Идеи:\n"] + [f"[{i[0]}] {i[1]}" for i in ideas]
             await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
         else:
             await update.message.reply_text("Идей пока нет... поделись)", reply_markup=main_keyboard())
@@ -571,9 +651,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(clean)
 
 async def morning(context):
-    conn = sqlite3.connect(DB_PATH)
-    users = conn.execute("SELECT user_id, profile FROM users WHERE onboarding_done=1").fetchall()
-    conn.close()
+    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
     for uid, pj in users:
         profile = json.loads(pj)
         name = profile.get("name", "")
@@ -582,7 +660,7 @@ async def morning(context):
         now = datetime.now()
         msg = f"Доброе утро, {name} ☀️\n{now.strftime('%d.%m.%Y')}\n\n"
         if today_tasks:
-            msg += f"На сегодня задач: {len(today_tasks)}\n"
+            msg += f"На сегодня: {len(today_tasks)} задач\n"
             for t in today_tasks[:3]: msg += f"• {t[1]}\n"
         if urgent:
             msg += f"\n🔴 Срочных: {len(urgent)}"
@@ -591,9 +669,7 @@ async def morning(context):
         except: pass
 
 async def evening(context):
-    conn = sqlite3.connect(DB_PATH)
-    users = conn.execute("SELECT user_id, profile FROM users WHERE onboarding_done=1").fetchall()
-    conn.close()
+    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
     for uid, pj in users:
         profile = json.loads(pj)
         name = profile.get("name", "")
@@ -604,7 +680,7 @@ async def evening(context):
         if tasks: msg += f"Открытых задач: {len(tasks)}\n"
         if inactive:
             labels = [SPHERES[s] for s in list(inactive)[:2]]
-            msg += f"Сегодня не касалась: {', '.join(labels)}"
+            msg += f"Не касалась: {', '.join(labels)}"
         try: await context.bot.send_message(uid, msg)
         except: pass
 
@@ -615,7 +691,15 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("newuser", cmd_newuser))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("week", cmd_week))
+    app.add_handler(CommandHandler("goals", cmd_goals))
+    app.add_handler(CommandHandler("ideas", cmd_ideas))
+    app.add_handler(CommandHandler("focus", cmd_focus))
+    app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     jq = app.job_queue
     jq.run_daily(morning, dtime(5, 0))
