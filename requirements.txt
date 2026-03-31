@@ -2,6 +2,6 @@ httpx
 python-telegram-bot[job-queue]
 python-dotenv
 libsql-experimental
-google-auth-oauthlib
+google-auth-oauthlib=0.8.0
 google-api-python-client
 aiohttp
