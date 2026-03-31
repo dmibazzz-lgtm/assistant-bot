@@ -2,6 +2,9 @@ import os, sys, httpx, sqlite3, json, logging, re, base64
 from datetime import datetime, time as dtime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
@@ -11,6 +14,11 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 TURSO_URL = os.environ.get("TURSO_URL")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://nova-bot-production.up.railway.app")
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def get_conn():
     if TURSO_URL and TURSO_TOKEN:
@@ -59,6 +67,14 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS sphere_activity (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, sphere TEXT, activity_date TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS google_tokens (
+        user_id INTEGER PRIMARY KEY,
+        token TEXT,
+        refresh_token TEXT,
+        token_uri TEXT,
+        client_id TEXT,
+        client_secret TEXT,
+        scopes TEXT)""")
     conn.commit()
     if hasattr(conn, 'sync'): conn.sync()
     conn.close()
@@ -188,6 +204,75 @@ def get_sphere_stats(uid):
                  GROUP BY sphere ORDER BY COUNT(*) DESC""", (uid,))
     return {r[0]: r[1] for r in rows}
 
+# Google Calendar functions
+def save_google_token(uid, creds):
+    db_exec("""INSERT OR REPLACE INTO google_tokens 
+               (user_id, token, refresh_token, token_uri, client_id, client_secret, scopes)
+               VALUES (?,?,?,?,?,?,?)""",
+            (uid, creds.token, creds.refresh_token, creds.token_uri,
+             creds.client_id, creds.client_secret, json.dumps(creds.scopes)))
+
+def get_google_token(uid):
+    row = db_fetchone("SELECT * FROM google_tokens WHERE user_id=?", (uid,))
+    if not row: return None
+    creds = Credentials(
+        token=row[1], refresh_token=row[2], token_uri=row[3],
+        client_id=row[4], client_secret=row[5],
+        scopes=json.loads(row[6]))
+    return creds
+
+def get_calendar_service(uid):
+    creds = get_google_token(uid)
+    if not creds: return None
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        return service
+    except Exception as e:
+        logging.error(f"Calendar service error: {e}")
+        return None
+
+def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
+    service = get_calendar_service(uid)
+    if not service: return False
+    try:
+        now = datetime.now()
+        if due_date:
+            start_date = due_date
+        elif timeframe == "today":
+            start_date = now.date().isoformat()
+        elif timeframe == "week":
+            from datetime import timedelta
+            start_date = (now + timedelta(days=3)).date().isoformat()
+        else:
+            from datetime import timedelta
+            start_date = (now + timedelta(days=7)).date().isoformat()
+
+        event = {
+            "summary": task_text,
+            "start": {"date": start_date},
+            "end": {"date": start_date},
+        }
+        service.events().insert(calendarId="primary", body=event).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Calendar add error: {e}")
+        return False
+
+def get_oauth_flow():
+    return Flow.from_client_config(
+        {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [f"{WEBHOOK_URL}/oauth/callback"]
+            }
+        },
+        scopes=SCOPES,
+        redirect_uri=f"{WEBHOOK_URL}/oauth/callback"
+    )
+
 SPHERES = {
     "work": "💼 Работа & Карьера",
     "finance": "💰 Финансы & Деньги",
@@ -296,12 +381,15 @@ def format_dashboard(uid):
     stats = get_sphere_stats(uid)
     urgent = [t for t in all_tasks if t[2] == "urgent"]
     now = datetime.now()
+    gcal = get_google_token(uid)
+    cal_status = "✅ подключён" if gcal else "❌ не подключён"
     lines = [
         f"📊 {name} — {now.strftime('%d.%m.%Y')}",
         "",
         f"📅 Сегодня: {len(today_tasks)} задач",
         f"📌 Всего: {len(all_tasks)} | 🔴 Срочных: {len(urgent)}",
         f"🎯 Целей: {len(goals)} | 💡 Идей: {len(ideas)}",
+        f"📆 Google Календарь: {cal_status}",
     ]
     if stats:
         lines.append("")
@@ -406,7 +494,8 @@ def build_system(profile, onboarding_mode=False):
 - *жирный* для важного
 - _курсив_ для акцентов
 - Смайлики уместно, не в каждой строке
-- Максимум 5-6 строк в сообщении
+- Максимум 4 строки в сообщении
+- Без вступлений, сразу по делу
 - Списки через • когда нужно перечислить
 
 ПРАВИЛО ПРО ЗАДАЧИ — ВАЖНО:
@@ -499,8 +588,10 @@ def process_response(uid, text):
     for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, match[0], match[1], match[2], match[3])
         log_sphere_activity(uid, match[2])
+        add_to_calendar(uid, match[0], timeframe=match[3])
     for t, p, s in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, t, p, s)
+        add_to_calendar(uid, t)
     for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_goal(uid, t, s, tf)
     for t, s in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\]', text):
@@ -633,9 +724,31 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await send_safe(update, "Отлично, поехали! 🚀", main_keyboard())
 
+async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    existing = get_google_token(uid)
+    if existing:
+        await update.message.reply_text("✅ Google Календарь уже подключён!\n\nВсе новые задачи автоматически попадают в календарь.", reply_markup=main_keyboard())
+        return
+    try:
+        flow = get_oauth_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            state=str(uid),
+            prompt="consent"
+        )
+        await update.message.reply_text(
+            f"📆 Подключаем Google Календарь!\n\nНажми на ссылку, войди в Google и разреши доступ:\n\n{auth_url}\n\nПосле авторизации бот автоматически получит доступ.",
+            reply_markup=main_keyboard()
+        )
+    except Exception as e:
+        logging.error(f"Calendar auth error: {e}")
+        await update.message.reply_text("Что-то пошло не так при подключении календаря(", reply_markup=main_keyboard())
+
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    for t in ["users","messages","tasks","goals","ideas","sphere_activity"]:
+    for t in ["users","messages","tasks","goals","ideas","sphere_activity","google_tokens"]:
         db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
     await update.message.reply_text("Сброс выполнен. Напиши /start")
 
@@ -845,7 +958,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_forward(update, context)
         return
 
-
     user = get_user(uid)
     if await handle_menu_button(update, context):
         return
@@ -859,7 +971,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tasks = get_tasks(uid)
         if tasks:
             system += "\n\nАктуальные задачи:\n" + "\n".join([f"[{t[0]}] ({t[2]}) {t[1]}" for t in tasks[:10]])
-
         frozen = get_frozen_items(uid)
         if frozen and len(tasks) == 0:
             items_text = "\n".join([f"- {f[1]}" for f in frozen])
@@ -931,6 +1042,28 @@ async def weekly_review(context):
         try: await context.bot.send_message(uid, msg)
         except: pass
 
+from aiohttp import web
+
+async def oauth_callback(request):
+    code = request.rel_url.query.get("code")
+    state = request.rel_url.query.get("state")
+    if not code or not state:
+        return web.Response(text="Ошибка авторизации")
+    try:
+        uid = int(state)
+        flow = get_oauth_flow()
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        save_google_token(uid, creds)
+        await request.app["bot"].send_message(
+            uid,
+            "✅ Google Календарь успешно подключён!\n\nТеперь все твои задачи будут автоматически появляться в календаре 📆"
+        )
+        return web.Response(text="✅ Готово! Можешь закрыть эту вкладку и вернуться в Telegram.")
+    except Exception as e:
+        logging.error(f"OAuth callback error: {e}")
+        return web.Response(text="Что-то пошло не так. Попробуй ещё раз.")
+
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -946,6 +1079,7 @@ def main():
     app.add_handler(CommandHandler("ideas", cmd_ideas))
     app.add_handler(CommandHandler("focus", cmd_focus))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
+    app.add_handler(CommandHandler("calendar", cmd_calendar))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -955,6 +1089,19 @@ def main():
     jq.run_daily(morning, dtime(5, 0))
     jq.run_daily(evening, dtime(18, 0))
     jq.run_daily(weekly_review, dtime(9, 0), days=(6,))
+
+    # Web server for OAuth callback
+    async def start_web(app_obj):
+        web_app = web.Application()
+        web_app["bot"] = app_obj.bot
+        web_app.router.add_get("/oauth/callback", oauth_callback)
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
+        await site.start()
+        logging.info("Web server started")
+
+    app.post_init = start_web
     logging.info("Nova is running...")
     app.run_polling()
 
