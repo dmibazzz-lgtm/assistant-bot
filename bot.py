@@ -841,9 +841,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
 
-    if update.message.forward_date:
+    if getattr(update.message, 'forward_origin', None) or getattr(update.message, 'forward_from', None) or getattr(update.message, 'forward_from_chat', None):
         await handle_forward(update, context)
         return
+
 
     user = get_user(uid)
     if await handle_menu_button(update, context):
