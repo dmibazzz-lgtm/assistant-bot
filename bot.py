@@ -1,4 +1,4 @@
-import os, sys, httpx, sqlite3, json, logging, re
+import os, sys, httpx, sqlite3, json, logging, re, base64
 from datetime import datetime, time as dtime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -20,7 +20,7 @@ def get_conn():
             conn.sync()
             return conn
         except Exception as e:
-            logging.warning(f"Turso failed, using local: {e}")
+            logging.warning(f"Turso failed: {e}")
     return sqlite3.connect("assistant.db")
 
 def init_db():
@@ -53,7 +53,9 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS ideas (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, text TEXT,
-        sphere TEXT DEFAULT 'general', created_at TEXT)""")
+        sphere TEXT DEFAULT 'general',
+        reviewed_at TEXT,
+        created_at TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS sphere_activity (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, sphere TEXT, activity_date TEXT)""")
@@ -115,6 +117,8 @@ def clear_history(uid):
     db_exec("DELETE FROM messages WHERE user_id=?", (uid,))
 
 def add_task(uid, text, priority="normal", sphere="general", timeframe="week", due_date=None):
+    existing = db_fetch("SELECT id FROM tasks WHERE user_id=? AND text=? AND done=0", (uid, text))
+    if existing: return
     db_exec("INSERT INTO tasks (user_id,text,priority,sphere,timeframe,due_date,created_at) VALUES (?,?,?,?,?,?,?)",
             (uid, text, priority, sphere, timeframe, due_date, datetime.now().isoformat()))
 
@@ -136,7 +140,17 @@ def get_today_tasks(uid):
 def complete_task(task_id):
     db_exec("UPDATE tasks SET done=1 WHERE id=?", (task_id,))
 
+def delete_task(task_id):
+    db_exec("DELETE FROM tasks WHERE id=?", (task_id,))
+
+def edit_task(task_id, text=None, priority=None, timeframe=None):
+    if text: db_exec("UPDATE tasks SET text=? WHERE id=?", (text, task_id))
+    if priority: db_exec("UPDATE tasks SET priority=? WHERE id=?", (priority, task_id))
+    if timeframe: db_exec("UPDATE tasks SET timeframe=? WHERE id=?", (timeframe, task_id))
+
 def add_goal(uid, text, sphere="general", timeframe="longterm"):
+    existing = db_fetch("SELECT id FROM goals WHERE user_id=? AND text=? AND done=0", (uid, text))
+    if existing: return
     db_exec("INSERT INTO goals (user_id,text,sphere,timeframe,created_at) VALUES (?,?,?,?,?)",
             (uid, text, sphere, timeframe, datetime.now().isoformat()))
 
@@ -148,13 +162,21 @@ def get_goals(uid, sphere=None, timeframe=None):
     return db_fetch(query, params)
 
 def add_idea(uid, text, sphere="general"):
+    existing = db_fetch("SELECT id FROM ideas WHERE user_id=? AND text=?", (uid, text))
+    if existing: return
     db_exec("INSERT INTO ideas (user_id,text,sphere,created_at) VALUES (?,?,?,?)",
             (uid, text, sphere, datetime.now().isoformat()))
 
 def get_ideas(uid, sphere=None):
     if sphere:
-        return db_fetch("SELECT id,text,sphere FROM ideas WHERE user_id=? AND sphere=?", (uid, sphere))
-    return db_fetch("SELECT id,text,sphere FROM ideas WHERE user_id=?", (uid,))
+        return db_fetch("SELECT id,text,sphere,created_at FROM ideas WHERE user_id=? AND sphere=?", (uid, sphere))
+    return db_fetch("SELECT id,text,sphere,created_at FROM ideas WHERE user_id=?", (uid,))
+
+def get_frozen_items(uid):
+    week_ago = datetime.now().replace(day=datetime.now().day - 7).isoformat()[:10]
+    ideas = db_fetch("SELECT id,text,sphere,'idea' FROM ideas WHERE user_id=? AND (reviewed_at IS NULL OR reviewed_at < ?)", (uid, week_ago))
+    goals = db_fetch("SELECT id,text,sphere,'goal' FROM goals WHERE user_id=? AND done=0 AND progress=0 AND created_at < ?", (uid, week_ago))
+    return ideas[:3] + goals[:2]
 
 def log_sphere_activity(uid, sphere):
     db_exec("INSERT INTO sphere_activity (user_id,sphere,activity_date) VALUES (?,?,?)",
@@ -184,7 +206,7 @@ def main_keyboard():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📋 Задачи"), KeyboardButton("🎯 Цели")],
         [KeyboardButton("🌀 Сферы жизни"), KeyboardButton("💡 Идеи")],
-        [KeyboardButton("📊 Дашборд")]
+        [KeyboardButton("📊 Дашборд"), KeyboardButton("📅 План недели")]
     ], resize_keyboard=True)
 
 def tasks_keyboard():
@@ -225,17 +247,43 @@ def sphere_detail_keyboard(sphere_key):
          InlineKeyboardButton("⬅️ К сферам", callback_data="back_spheres")]
     ])
 
-def safe_send(text):
-    """Убирает символы которые ломают Markdown в Telegram"""
-    return text.replace("_", "\\_").replace("*", "\\*") if False else text
+def task_actions_keyboard(task_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Выполнено", callback_data=f"tdone_{task_id}"),
+         InlineKeyboardButton("🗑 Удалить", callback_data=f"tdel_{task_id}")],
+        [InlineKeyboardButton("📅 Перенести", callback_data=f"tmove_{task_id}"),
+         InlineKeyboardButton("⬅️ Назад", callback_data="tasks_all")]
+    ])
 
-def format_tasks(tasks):
+def format_tasks(tasks, with_actions=False):
     if not tasks: return "Пусто 👌"
     icons = {"urgent": "🔴", "important": "🟡", "normal": "⚪"}
     lines = []
     for t in tasks:
         icon = icons.get(t[2], "⚪")
-        lines.append(f"{icon} {t[1]}")
+        lines.append(f"{icon} [{t[0]}] {t[1]}")
+    return "\n".join(lines)
+
+def format_week_plan(uid):
+    from datetime import timedelta
+    now = datetime.now()
+    lines = [f"📅 *План на неделю*\n{now.strftime('%d.%m')} — {(now + timedelta(days=6)).strftime('%d.%m')}\n"]
+    today = get_today_tasks(uid)
+    week = get_tasks(uid, timeframe="week")
+    urgent = get_tasks(uid, priority="urgent")
+    if urgent:
+        lines.append("🔴 *Срочно:*")
+        for t in urgent[:5]: lines.append(f"• {t[1]}")
+        lines.append("")
+    if today:
+        lines.append("📅 *Сегодня:*")
+        for t in today[:5]: lines.append(f"• {t[1]}")
+        lines.append("")
+    if week:
+        lines.append("📆 *На этой неделе:*")
+        for t in week[:7]: lines.append(f"• {t[1]}")
+    if not urgent and not today and not week:
+        lines.append("Задач нет — отличное время добавить новые 🙂")
     return "\n".join(lines)
 
 def format_dashboard(uid):
@@ -249,13 +297,11 @@ def format_dashboard(uid):
     urgent = [t for t in all_tasks if t[2] == "urgent"]
     now = datetime.now()
     lines = [
-        f"📊 Дашборд — {name}",
-        f"📅 {now.strftime('%d.%m.%Y')}",
+        f"📊 {name} — {now.strftime('%d.%m.%Y')}",
         "",
-        f"Сегодня: {len(today_tasks)} задач",
-        f"Всего открытых: {len(all_tasks)}",
-        f"Срочных: {len(urgent)} 🔴",
-        f"Целей: {len(goals)} | Идей: {len(ideas)}",
+        f"📅 Сегодня: {len(today_tasks)} задач",
+        f"📌 Всего: {len(all_tasks)} | 🔴 Срочных: {len(urgent)}",
+        f"🎯 Целей: {len(goals)} | 💡 Идей: {len(ideas)}",
     ]
     if stats:
         lines.append("")
@@ -264,8 +310,8 @@ def format_dashboard(uid):
         for sk, cnt in stats.items():
             lines.append(f"  {SPHERES.get(sk, sk)}: {'▓' * min(cnt, 8)}")
         if inactive:
-            lines.append("Без внимания:")
-            for s in list(inactive)[:3]:
+            lines.append("😴 Без внимания:")
+            for s in list(inactive)[:2]:
                 lines.append(f"  {SPHERES.get(s, s)}")
     return "\n".join(lines)
 
@@ -275,9 +321,9 @@ ONBOARDING_INTRO = """👋 Привет! Я Нова — твой персона
 📋 Принимаю все задачи, дела и планы — в любом формате
 🗓 Распределяю по времени и приоритетам
 🎯 Отслеживаю цели и сферы жизни
-💡 Храню идеи и желания
+💡 Храню идеи, мечты и желания
 🔔 Напоминаю и слежу за прогрессом
-🎤 Понимаю голосовые сообщения
+🎤 Понимаю голосовые сообщения и фото
 
 Моя главная задача — полностью разгрузить твою голову. Ты говоришь — я организую, планирую, напоминаю.
 
@@ -290,11 +336,12 @@ ONBOARDING_INTRO = """👋 Привет! Я Нова — твой персона
 def build_system(profile, onboarding_mode=False):
     p = ""
     if profile.get("name"): p += f"Имя: {profile['name']}\n"
-    if profile.get("occupation"): p += f"Работа/проекты: {profile['occupation']}\n"
+    if profile.get("occupation"): p += f"Работа: {profile['occupation']}\n"
     if profile.get("goals"): p += f"Цели: {profile['goals']}\n"
     if profile.get("pain"): p += f"Что мешает: {profile['pain']}\n"
     if profile.get("satisfied"): p += f"Что хорошо: {profile['satisfied']}\n"
     if profile.get("day_rhythm"): p += f"Ритм дня: {profile['day_rhythm']}\n"
+    if profile.get("timezone"): p += f"Часовой пояс: {profile['timezone']}\n"
     if profile.get("character"): p += f"Характер: {profile['character']}\n"
     if profile.get("notes"): p += f"Заметки: {profile['notes']}\n"
 
@@ -304,43 +351,36 @@ def build_system(profile, onboarding_mode=False):
     onboarding_block = ""
     if onboarding_mode:
         onboarding_block = """
-РЕЖИМ ОНБОРДИНГА — глубокое знакомство:
+РЕЖИМ ОНБОРДИНГА:
+Веди разговор как умный ассистент на первой встрече. Задавай вопросы по одному.
 
-Веди разговор как умный внимательный ассистент на первой встрече.
-Задавай вопросы по одному, слушай внимательно, цепляйся за детали.
-
-Блоки вопросов (проходи последовательно):
-
-БЛОК 1 — Кто ты:
-- Как тебя зовут?
-- Чем занимаешься? Работа, проекты, фриланс — расскажи свободно
-- Где тебе больше всего нужна помощь прямо сейчас?
-- Есть ли привычные инструменты планирования или всё в голове?
+БЛОК 1 — Знакомство:
+- Чем занимаешься? Работа, проекты, фриланс
+- Где больше всего нужна помощь прямо сейчас?
+- Есть привычные инструменты планирования или всё в голове?
+- В каком часовом поясе живёшь? (для правильного времени напоминаний)
 
 БЛОК 2 — Дела и планы:
-- Расскажи всё что сейчас висит в голове — задачи, дела, то что давно откладываешь. Просто выгрузи всё подряд
+- Расскажи всё что сейчас висит в голове — задачи, дела, то что давно откладываешь
 - Есть срочные дела на ближайшие дни?
-- Какие планы на ближайший месяц?
+- Какие планы на месяц?
 
 БЛОК 3 — Сферы жизни:
-- Оцени от 1 до 10: работа, деньги, здоровье, отношения, развитие. Где сейчас хуже всего?
-- В какой сфере хочешь видеть прогресс в первую очередь?
+- Оцени от 1 до 10: работа, деньги, здоровье, отношения, развитие. Где хуже всего?
+- В какой сфере хочешь прогресс в первую очередь?
 
-БЛОК 4 — Мечты, идеи, страхи:
-- Есть большая цель или мечта — то к чему идёшь?
+БЛОК 4 — Мечты и идеи:
+- Есть большая цель или мечта?
 - Что чаще всего мешает двигаться вперёд?
 - Есть идеи или желания которые давно лежат?
-- Что тебя вдохновляет и что забирает энергию?
 
 Правила:
 - Один вопрос за раз
-- Если человек рассказывает что-то важное — уточни, не торопись дальше
-- Всё что узнаёшь — фиксируй через [PROFILE: ключ=значение]
-- Если человек упомянул задачу — сразу [TASK: текст | приоритет | сфера | timeframe]
-- Если цель — [GOAL: текст | сфера | timeframe]
-- Если идею — [IDEA: текст | сфера]
-- Если видишь яркую черту характера — фиксируй [PROFILE: character=описание]
-- После всех блоков скажи что готова работать и предложи открыть меню командой /done
+- Цепляйся за детали, уточняй
+- Фиксируй: [PROFILE: ключ=значение]
+- Задачи фиксируй только если человек явно говорит что это задача
+- Идеи и мечты — всегда фиксируй: [IDEA: текст | сфера]
+- После всех блоков скажи что готова работать и предложи /done
 """
 
     return f"""Ты — Нова. Персональный суперассистент по планированию, задачам и жизни.
@@ -348,42 +388,51 @@ def build_system(profile, onboarding_mode=False):
 {current_time}
 
 ГЛАВНАЯ ЗАДАЧА:
-Полностью разгружать голову человека. Принимать всё — задачи, планы, идеи, мысли — и превращать в чёткий структурированный план. Фиксировать, распределять по времени и приоритетам, отслеживать, напоминать, перераспределять нагрузку.
+Разгружать голову человека. Принимать всё — задачи, планы, идеи — и превращать в чёткий план. Фиксировать, распределять, отслеживать, напоминать, перераспределять нагрузку.
 
 ПРИОРИТЕТЫ:
-1. Ассистирование, планирование, задачи — основное
-2. Поддержка, советы, напоминания — всегда
-3. Сферы жизни — отслеживать и развивать
-4. Коучинг и психология — только если человек просит
+1. Планирование и задачи — основное
+2. Поддержка, советы, напоминания
+3. Сферы жизни — отслеживать
+4. Коучинг — только если человек просит
 
 ХАРАКТЕР:
 - Умная, живая, по делу
 - Не нянчишься — есть цель, идём к ней
-- Поддерживаешь, советуешь, предлагаешь варианты
-- Замечаешь когда человек перегружен — предлагаешь перераспределить
-- Говоришь прямо, с теплом
+- Поддерживаешь и советуешь
+- Замечаешь перегруз — предлагаешь перераспределить
 
 ФОРМАТИРОВАНИЕ (Telegram Markdown):
-- *жирный текст* — для важного, заголовков, ключевых слов
-- _курсив_ — для акцентов, мягких замечаний
-- Смайлики по теме — живо и уместно, не в каждой строке
-- Короткие сообщения — максимум 5-6 строк
-- Списки через дефис или буллеты когда нужно перечислить
+- *жирный* для важного
+- _курсив_ для акцентов
+- Смайлики уместно, не в каждой строке
+- Максимум 5-6 строк в сообщении
+- Списки через • когда нужно перечислить
 
-РАБОТА С ЗАДАЧАМИ:
-- Любое упоминание дела — сразу фиксируй
-- Сам определяй приоритет и срок
-- Предлагай когда и как лучше сделать
-- Если много задач — помогай расставить приоритеты
-- Предлагай перенести или перераспределить если нагрузка большая
+ПРАВИЛО ПРО ЗАДАЧИ — ВАЖНО:
+- Человек явно говорит "надо сделать", "запиши", "добавь" → фиксируй сам
+- Человек рассуждает или делится мыслями → СПРОСИ: "Добавить это как задачу?"
+- Только после подтверждения добавляй
+- Идеи и мечты ("хотелось бы", "мечтаю", "было бы здорово") → всегда фиксируй как идею без вопроса
+
+РЕДАКТИРОВАНИЕ ЗАДАЧ:
+Если человек говорит "удали задачу 5" → [DEL_TASK: 5]
+Если "выполни задачу 3" → [DONE_TASK: 3]
+Если "перенеси задачу 2 на следующую неделю" → [EDIT_TASK: 2 | timeframe=week]
+Если "измени задачу 1 на новый текст" → [EDIT_TASK: 1 | text=новый текст]
+
+ЗАМОРОЖЕННЫЕ ЭЛЕМЕНТЫ:
+Периодически поднимай идеи и цели которые давно лежат без движения.
+Предлагай запланировать или добавить в задачи.
 
 ФИКСИРУЙ В КОНЦЕ (невидимо):
 [TASK: текст | приоритет | сфера | timeframe]
-приоритет: urgent/important/normal
-timeframe: today/week/month/longterm
 [GOAL: текст | сфера | timeframe]
 [IDEA: текст | сфера]
 [PROFILE: ключ=значение]
+[DEL_TASK: id]
+[DONE_TASK: id]
+[EDIT_TASK: id | поле=значение]
 
 СФЕРЫ: {', '.join(SPHERES.values())}
 
@@ -409,10 +458,32 @@ async def call_claude(messages, system):
                               headers=headers, json=data, timeout=45)
     return r.json()["content"][0]["text"]
 
+async def call_claude_vision(image_b64, system, prompt="Опиши что на фото и извлеки любые задачи, планы или важную информацию."):
+    headers = {
+        "x-api-key": CLAUDE_API_KEY.encode('ascii', 'ignore').decode('ascii'),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    data = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 700,
+        "system": system,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post("https://api.anthropic.com/v1/messages",
+                              headers=headers, json=data, timeout=60)
+    return r.json()["content"][0]["text"]
+
 async def call_groq_voice(audio_bytes):
     GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-    if not GROQ_API_KEY:
-        return None
+    if not GROQ_API_KEY: return None
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -421,8 +492,7 @@ async def call_groq_voice(audio_bytes):
             data={"model": "whisper-large-v3", "language": "ru"},
             timeout=30
         )
-    if r.status_code == 200:
-        return r.json().get("text")
+    if r.status_code == 200: return r.json().get("text")
     return None
 
 def process_response(uid, text):
@@ -437,6 +507,16 @@ def process_response(uid, text):
         add_goal(uid, t, s)
     for t, s in re.findall(r'\[IDEA:\s*(.+?)\s*\|\s*(\w+)\s*\]', text):
         add_idea(uid, t, s)
+    for tid in re.findall(r'\[DONE_TASK:\s*(\d+)\s*\]', text):
+        complete_task(int(tid))
+    for tid in re.findall(r'\[DEL_TASK:\s*(\d+)\s*\]', text):
+        delete_task(int(tid))
+    for match in re.findall(r'\[EDIT_TASK:\s*(\d+)\s*\|\s*(.+?)\s*\]', text):
+        tid = int(match[0])
+        for pair in match[1].split('|'):
+            if '=' in pair:
+                k, _, v = pair.partition('=')
+                edit_task(tid, **{k.strip(): v.strip()})
     profile_matches = re.findall(r'\[PROFILE:\s*(.+?)\s*\]', text)
     if profile_matches:
         profile = get_profile(uid)
@@ -446,11 +526,10 @@ def process_response(uid, text):
                     k, _, v = pair.partition('=')
                     profile[k.strip()] = v.strip()
         save_profile(uid, profile)
-    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE):[^\]]+\]', '', text)
+    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK):[^\]]+\]', '', text)
     return text.strip()
 
 async def send_safe(update, text, reply_markup=None):
-    """Отправляет с Markdown, при ошибке — без форматирования"""
     try:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
     except Exception:
@@ -485,19 +564,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "tasks_done":
         await edit(f"✅ *Выполненные:*\n\n{format_tasks(get_tasks(uid, done=1))}", tasks_keyboard()); return
     if data == "tasks_all":
-        await edit(f"📋 *Все задачи:*\n\n{format_tasks(get_tasks(uid))}", tasks_keyboard()); return
+        tasks = get_tasks(uid)
+        await edit(f"📋 *Все задачи:*\n\n{format_tasks(tasks)}", tasks_keyboard()); return
     if data == "goals_short":
         goals = get_goals(uid, timeframe="short")
-        text = "*⚡ Краткосрочные:*\n\n" + ("\n".join([f"• {g[1]}" for g in goals]) if goals else "Пусто 👌")
+        text = "*⚡ Краткосрочные:*\n\n" + ("\n".join([f"• [{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто 👌")
         await edit(text, goals_keyboard()); return
     if data == "goals_long":
         goals = get_goals(uid, timeframe="longterm")
-        text = "*🏔 Долгосрочные:*\n\n" + ("\n".join([f"• {g[1]}" for g in goals]) if goals else "Пусто 👌")
+        text = "*🏔 Долгосрочные:*\n\n" + ("\n".join([f"• [{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто 👌")
         await edit(text, goals_keyboard()); return
     if data == "goals_all":
         goals = get_goals(uid)
-        text = "*🎯 Все цели:*\n\n" + ("\n".join([f"• {g[1]}" for g in goals]) if goals else "Пусто 👌")
+        text = "*🎯 Все цели:*\n\n" + ("\n".join([f"• [{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто 👌")
         await edit(text, goals_keyboard()); return
+    if data.startswith("tdone_"):
+        complete_task(int(data.replace("tdone_", "")))
+        await edit("✅ Задача выполнена!", tasks_keyboard()); return
+    if data.startswith("tdel_"):
+        delete_task(int(data.replace("tdel_", "")))
+        await edit("🗑 Задача удалена.", tasks_keyboard()); return
+    if data.startswith("tmove_"):
+        tid = data.replace("tmove_", "")
+        await edit(f"Напиши мне: 'перенеси задачу {tid} на [когда]'"); return
     if data.startswith("sphere_"):
         sk = data.replace("sphere_", "")
         log_sphere_activity(uid, sk)
@@ -515,8 +604,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ideas = get_ideas(uid, sphere=sk)
         text = f"{SPHERES.get(sk)} — идеи:\n\n" + ("\n".join([f"• {i[1]}" for i in ideas]) if ideas else "Пусто 👌")
         await edit(text, sphere_detail_keyboard(sk)); return
-    if data.startswith("back_spheres"):
-        await edit("Выбери сферу:", spheres_keyboard()); return
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -538,7 +625,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system = build_system(profile)
     try:
         response = await call_claude(
-            get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай краткий вывод — что ты знаешь обо мне, мои сильные стороны и с чего начнём работать. Потом скажи что открываешь меню."}],
+            get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай краткий вывод — что знаешь обо мне и с чего начнём. Открой меню."}],
             system)
         clean = process_response(uid, response)
         save_msg(uid, "assistant", clean)
@@ -562,7 +649,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not profile:
         await update.message.reply_text("Профиль пока пустой.", reply_markup=main_keyboard()); return
     labels = {"name":"Имя","occupation":"Работа","goals":"Цели","pain":"Что мешает",
-              "satisfied":"Что хорошо","day_rhythm":"Ритм дня","character":"Характер","notes":"Заметки"}
+              "satisfied":"Что хорошо","day_rhythm":"Ритм дня","timezone":"Часовой пояс","character":"Характер","notes":"Заметки"}
     lines = ["*Что я знаю о тебе:*\n"]
     for k, l in labels.items():
         if profile.get(k): lines.append(f"*{l}:* {profile[k]}")
@@ -576,20 +663,24 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks = get_tasks(update.effective_user.id, timeframe="week")
     await send_safe(update, f"📆 *На неделю:*\n\n{format_tasks(tasks)}", main_keyboard())
 
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await send_safe(update, format_week_plan(uid), main_keyboard())
+
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     goals = get_goals(uid)
     if goals:
-        lines = ["*🎯 Твои цели:*\n"] + [f"• {g[1]}" for g in goals]
+        lines = ["*🎯 Твои цели:*\n"] + [f"• [{g[0]}] {g[1]}" for g in goals]
         await send_safe(update, "\n".join(lines), main_keyboard())
     else:
-        await update.message.reply_text("Целей пока нет 🎯 Расскажи о чём мечтаешь)", reply_markup=main_keyboard())
+        await update.message.reply_text("Целей пока нет 🎯", reply_markup=main_keyboard())
 
 async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ideas = get_ideas(uid)
     if ideas:
-        lines = ["*💡 Идеи:*\n"] + [f"• {i[1]}" for i in ideas]
+        lines = ["*💡 Идеи и мечты:*\n"] + [f"• [{i[0]}] {i[1]}" for i in ideas]
         await send_safe(update, "\n".join(lines), main_keyboard())
     else:
         await update.message.reply_text("Идей пока нет 💡", reply_markup=main_keyboard())
@@ -602,7 +693,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_list = "\n".join([f"- ({t[2]}) {t[1]}" for t in tasks[:10]]) if tasks else "Задач нет"
     try:
         response = await call_claude(
-            [{"role": "user", "content": f"Режим фокуса. Мои задачи:\n{task_list}\n\nПомоги выбрать одну самую важную прямо сейчас и объясни почему."}],
+            [{"role": "user", "content": f"Режим фокуса. Задачи:\n{task_list}\n\nОдна самая важная прямо сейчас — какая и почему?"}],
             system)
         clean = process_response(uid, response)
         await send_safe(update, clean, main_keyboard())
@@ -631,7 +722,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Слушаю... 🎤")
     text = await call_groq_voice(bytes(audio_bytes))
     if not text:
-        await update.message.reply_text("Не смогла расшифровать( Попробуй ещё раз или напиши текстом.")
+        await update.message.reply_text("Не смогла расшифровать( Попробуй ещё раз.")
         return
     user = get_user(uid)
     profile = get_profile(uid)
@@ -644,8 +735,82 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(history, system)
         clean = process_response(uid, response)
         save_msg(uid, "assistant", clean)
-        reply = f"_Ты сказала:_ {text}\n\n{clean}"
-        await send_safe(update, reply, main_keyboard() if onboarding_done else None)
+        await send_safe(update, f"_Ты сказала:_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
+    except:
+        await update.message.reply_text("Что-то пошло не так)")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    await update.message.reply_text("Смотрю фото... 👀")
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    photo_bytes = await file.download_as_bytearray()
+    image_b64 = base64.b64encode(bytes(photo_bytes)).decode('utf-8')
+    caption = update.message.caption or ""
+    profile = get_profile(uid)
+    user = get_user(uid)
+    system = build_system(profile, onboarding_mode=not user[1])
+    prompt = f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} Опиши что видишь, извлеки задачи, планы, важную информацию. Если есть список дел или заметки — зафикисруй их."
+    try:
+        response = await call_claude_vision(image_b64, system, prompt)
+        clean = process_response(uid, response)
+        save_msg(uid, "user", f"[фото] {caption}")
+        save_msg(uid, "assistant", clean)
+        await send_safe(update, clean, main_keyboard() if user[1] else None)
+    except Exception as e:
+        logging.error(f"Photo error: {e}")
+        await update.message.reply_text("Не смогла обработать фото( Попробуй ещё раз.")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    doc = update.message.document
+    if not doc.mime_type or not doc.mime_type.startswith('text'):
+        await update.message.reply_text("Пока умею читать только текстовые файлы (.txt, .md)")
+        return
+    await update.message.reply_text("Читаю документ... 📄")
+    file = await context.bot.get_file(doc.file_id)
+    file_bytes = await file.download_as_bytearray()
+    try:
+        text_content = file_bytes.decode('utf-8')
+    except:
+        text_content = file_bytes.decode('latin-1')
+    if len(text_content) > 3000:
+        text_content = text_content[:3000] + "...[обрезано]"
+    profile = get_profile(uid)
+    user = get_user(uid)
+    system = build_system(profile, onboarding_mode=not user[1])
+    history = get_history(uid)
+    history.append({"role": "user", "content": f"Я прислала документ '{doc.file_name}':\n\n{text_content}\n\nПроанализируй, извлеки задачи и важную информацию."})
+    save_msg(uid, "user", f"[документ: {doc.file_name}]")
+    try:
+        response = await call_claude(history, system)
+        clean = process_response(uid, response)
+        save_msg(uid, "assistant", clean)
+        await send_safe(update, clean, main_keyboard() if user[1] else None)
+    except Exception as e:
+        logging.error(f"Doc error: {e}")
+        await update.message.reply_text("Не смогла обработать документ(")
+
+async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    text = update.message.text or update.message.caption or ""
+    if not text:
+        await update.message.reply_text("Пересланное сообщение без текста — не могу обработать(")
+        return
+    profile = get_profile(uid)
+    user = get_user(uid)
+    system = build_system(profile, onboarding_mode=not user[1])
+    history = get_history(uid)
+    history.append({"role": "user", "content": f"Я переслала сообщение:\n\n{text}\n\nОбработай — извлеки задачи, важную информацию или просто прокомментируй."})
+    save_msg(uid, "user", f"[пересланное] {text[:100]}")
+    try:
+        response = await call_claude(history, system)
+        clean = process_response(uid, response)
+        save_msg(uid, "assistant", clean)
+        await send_safe(update, clean, main_keyboard() if user[1] else None)
     except:
         await update.message.reply_text("Что-то пошло не так)")
 
@@ -661,20 +826,26 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if text == "💡 Идеи":
         ideas = get_ideas(uid)
         if ideas:
-            lines = ["*💡 Идеи:*\n"] + [f"• {i[1]}" for i in ideas]
+            lines = ["*💡 Идеи и мечты:*\n"] + [f"• [{i[0]}] {i[1]}" for i in ideas]
             await send_safe(update, "\n".join(lines), main_keyboard())
         else:
             await update.message.reply_text("Идей пока нет... поделись)", reply_markup=main_keyboard())
         return True
     if text == "📊 Дашборд":
         await update.message.reply_text(format_dashboard(uid), reply_markup=main_keyboard()); return True
+    if text == "📅 План недели":
+        await send_safe(update, format_week_plan(uid), main_keyboard()); return True
     return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    user = get_user(uid)
 
+    if update.message.forward_date:
+        await handle_forward(update, context)
+        return
+
+    user = get_user(uid)
     if await handle_menu_button(update, context):
         return
 
@@ -686,7 +857,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if onboarding_done:
         tasks = get_tasks(uid)
         if tasks:
-            system += "\n\nАктуальные задачи:\n" + "\n".join([f"- ({t[2]}) {t[1]}" for t in tasks[:10]])
+            system += "\n\nАктуальные задачи:\n" + "\n".join([f"[{t[0]}] ({t[2]}) {t[1]}" for t in tasks[:10]])
+
+        frozen = get_frozen_items(uid)
+        if frozen and len(tasks) == 0:
+            items_text = "\n".join([f"- {f[1]}" for f in frozen])
+            system += f"\n\nЗамороженные идеи/цели (давно без движения):\n{items_text}\nЕсли уместно — предложи запланировать одну из них."
 
     history = get_history(uid)
     history.append({"role": "user", "content": text})
@@ -736,6 +912,24 @@ async def evening(context):
         try: await context.bot.send_message(uid, msg)
         except: pass
 
+async def weekly_review(context):
+    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
+    for uid, pj in users:
+        profile = json.loads(pj)
+        name = profile.get("name", "")
+        tasks = get_tasks(uid)
+        goals = get_goals(uid)
+        frozen = get_frozen_items(uid)
+        msg = f"📋 Еженедельный обзор, {name}!\n\n"
+        msg += f"Открытых задач: {len(tasks)}\n"
+        msg += f"Активных целей: {len(goals)}\n"
+        if frozen:
+            msg += f"\n💡 Давно лежат без движения:\n"
+            for f in frozen[:3]: msg += f"• {f[1]}\n"
+            msg += "\nМожет пора запланировать что-то из этого?"
+        try: await context.bot.send_message(uid, msg)
+        except: pass
+
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -746,16 +940,20 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
+    app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("goals", cmd_goals))
     app.add_handler(CommandHandler("ideas", cmd_ideas))
     app.add_handler(CommandHandler("focus", cmd_focus))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     jq = app.job_queue
     jq.run_daily(morning, dtime(5, 0))
     jq.run_daily(evening, dtime(18, 0))
+    jq.run_daily(weekly_review, dtime(9, 0), days=(6,))
     logging.info("Nova is running...")
     app.run_polling()
 
