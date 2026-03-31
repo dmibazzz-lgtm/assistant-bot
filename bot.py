@@ -529,6 +529,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         update_user(uid, onboarding_step=1)
         await send_safe(update, ONBOARDING_INTRO)
+        save_msg(uid, "assistant", ONBOARDING_INTRO)
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
