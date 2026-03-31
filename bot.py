@@ -82,7 +82,7 @@ def init_db():
 def db_exec(query, params=()):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(query, params)
+    c.execute(query, tuple(params))
     conn.commit()
     if hasattr(conn, 'sync'): conn.sync()
     conn.close()
@@ -90,7 +90,7 @@ def db_exec(query, params=()):
 def db_fetch(query, params=()):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(query, params)
+    c.execute(query, tuple(params))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -98,7 +98,7 @@ def db_fetch(query, params=()):
 def db_fetchone(query, params=()):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(query, params)
+    c.execute(query, tuple(params))
     row = c.fetchone()
     conn.close()
     return row
@@ -145,7 +145,7 @@ def get_tasks(uid, sphere=None, timeframe=None, priority=None, done=0):
     if timeframe: query += " AND timeframe=?"; params.append(timeframe)
     if priority: query += " AND priority=?"; params.append(priority)
     query += " ORDER BY id"
-    return db_fetch(query, params)
+    return db_fetch(query, tuple(params))
 
 def get_today_tasks(uid):
     today = datetime.now().date().isoformat()
@@ -175,7 +175,7 @@ def get_goals(uid, sphere=None, timeframe=None):
     params = [uid]
     if sphere: query += " AND sphere=?"; params.append(sphere)
     if timeframe: query += " AND timeframe=?"; params.append(timeframe)
-    return db_fetch(query, params)
+    return db_fetch(query, tuple(params))
 
 def add_idea(uid, text, sphere="general"):
     existing = db_fetch("SELECT id FROM ideas WHERE user_id=? AND text=?", (uid, text))
@@ -204,7 +204,6 @@ def get_sphere_stats(uid):
                  GROUP BY sphere ORDER BY COUNT(*) DESC""", (uid,))
     return {r[0]: r[1] for r in rows}
 
-# Google Calendar functions
 def save_google_token(uid, creds):
     db_exec("""INSERT OR REPLACE INTO google_tokens
                (user_id, token, refresh_token, token_uri, client_id, client_secret, scopes)
@@ -251,13 +250,13 @@ def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
             "end": {"date": start_date},
         }
         service.events().insert(calendarId="primary", body=event).execute()
+        logging.info(f"Calendar event added for user {uid}: {task_text}")
         return True
     except Exception as e:
         logging.error(f"Calendar add error: {e}")
         return False
 
 def get_oauth_flow():
-    # ВАЖНО: используем без PKCE чтобы избежать "Missing code verifier"
     import os
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
     client_config = {
@@ -869,7 +868,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile = get_profile(uid)
     user = get_user(uid)
     system = build_system(profile, onboarding_mode=not user[1])
-    prompt = f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} Опиши что видишь, извлеки задачи, планы, важную информацию. Если есть список дел или заметки — зафикисруй их."
+    prompt = f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} Опиши что видишь, извлеки задачи, планы, важную информацию."
     try:
         response = await call_claude_vision(image_b64, system, prompt)
         clean = process_response(uid, response)
@@ -1057,7 +1056,6 @@ async def oauth_callback(request):
     try:
         uid = int(state)
         flow = get_oauth_flow()
-        # Отключаем проверку PKCE code_verifier
         flow.oauth2session.fetch_token(
             token_url="https://oauth2.googleapis.com/token",
             code=code,
