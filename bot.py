@@ -1,4 +1,4 @@
-import os, sys, httpx, sqlite3, json, logging, re, base64
+import os, sys, httpx, sqlite3, json, logging, re, base64, io, random
 from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -19,6 +19,115 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://assistant-bot-production-6438.up.railway.app")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+QUOTES = [
+    ("Единственный человек, которым ты должен стараться быть лучше, — это ты вчера.", "Аноним"),
+    ("Не бойся расти медленно. Бойся стоять на месте.", "Китайская мудрость"),
+    ("Успех — это сумма небольших усилий, повторяемых день за днём.", "Роберт Коллиер"),
+    ("Каждый день — это новая возможность стать лучшей версией себя.", "Аноним"),
+    ("Рост начинается там, где заканчивается зона комфорта.", "Нил Доналд Уолш"),
+    ("Не ждите. Время никогда не будет подходящим.", "Наполеон Хилл"),
+    ("Дисциплина — это мост между целями и достижениями.", "Джим Рон"),
+    ("Маленький прогресс каждый день суммируется в большие результаты.", "Аноним"),
+    ("Цель без плана — это просто мечта.", "Антуан де Сент-Экзюпери"),
+    ("Ставь большие цели, потому что маленькие не воспламеняют сердца.", "Микеланджело"),
+    ("Люди с ясными целями делают прогресс даже на труднейших дорогах.", "Томас Карлейль"),
+    ("Секрет успеха: начни.", "Марк Твен"),
+    ("Никогда не поздно быть тем, кем ты мог бы стать.", "Джордж Элиот"),
+    ("Каждая большая цель была когда-то невозможной.", "Аноним"),
+    ("Мечтай о большом, начинай с малого, действуй сейчас.", "Рой Беннетт"),
+    ("Ты не можешь вернуться и изменить начало, но можешь начать сейчас и изменить конец.", "К.С. Льюис"),
+    ("Успех обычно приходит к тем, кто слишком занят, чтобы его искать.", "Генри Дэвид Торо"),
+    ("Присутствовать в моменте — это высшая форма благодарности.", "Тит Нат Хан"),
+    ("Твоё время ограничено. Не трать его, живя чужой жизнью.", "Стив Джобс"),
+    ("Всё, что ты ищешь снаружи, уже есть внутри тебя.", "Руми"),
+    ("Пауза — это не потеря времени. Это инвестиция в ясность мышления.", "Аноним"),
+    ("Осознанность — это замечать жизнь, а не просто проживать её.", "Аноним"),
+    ("Когда ум спокоен, всё становится возможным.", "Аноним"),
+    ("Не будь занят — будь продуктивен.", "Тим Феррис"),
+    ("Фокус — это сказать «нет» сотне хороших идей ради одной великой.", "Стив Джобс"),
+    ("Начни с самой неприятной задачи. Остаток дня будет победой.", "Брайан Трейси"),
+    ("Прогресс, а не совершенство.", "Аноним"),
+    ("Делай меньше, но лучше.", "Дитер Рамс"),
+    ("Систематичность важнее вдохновения.", "Аноним"),
+    ("Управляй энергией, не временем.", "Джим Лоэр"),
+    ("Один хорошо выполненный час стоит десяти потраченных вхолостую.", "Аноним"),
+    ("Жизнь — это не то, что с тобой происходит, а то, что ты из этого делаешь.", "Аноним"),
+    ("Единственный способ делать отличную работу — любить то, что делаешь.", "Стив Джобс"),
+    ("Ты достаточен. Прямо сейчас.", "Аноним"),
+    ("Падение — часть роста. Подъём — твой выбор.", "Аноним"),
+    ("Не сравнивай свою главу 1 с чьей-то главой 20.", "Аноним"),
+    ("Трудности — это не препятствия на пути. Они и есть путь.", "Аноним"),
+    ("Твоя реакция — твоя суперсила.", "Аноним"),
+    ("Доверяй процессу. Результат придёт.", "Аноним"),
+    ("Смелость — не отсутствие страха, а решение, что что-то важнее страха.", "Нельсон Мандела"),
+    ("Будь таким человеком, которого ты сам хотел бы встретить.", "Аноним"),
+    ("Окружи себя теми, кто тянет тебя вверх.", "Опра Уинфри"),
+    ("Каждый человек в твоей жизни — учитель.", "Аноним"),
+    ("Слушать — это тоже форма любви.", "Аноним"),
+    ("Твоё тело — дом твоей жизни. Заботься о нём.", "Аноним"),
+    ("Движение — это жизнь. Остановка — начало конца.", "Аноним"),
+    ("Сон — не роскошь, а суперсила.", "Аноним"),
+    ("Восстановление так же важно, как и работа.", "Аноним"),
+    ("Маленькая забота о себе каждый день лучше большого ухода раз в год.", "Аноним"),
+    ("Богатство — это свобода выбора, а не просто деньги.", "Аноним"),
+    ("Инвестируй в себя. Это лучший вклад.", "Уоррен Баффет"),
+    ("Прошлое — урок. Настоящее — дар. Будущее — возможность.", "Аноним"),
+    ("Каждое утро — это второй шанс.", "Аноним"),
+    ("Делай то, что считаешь правильным, даже когда никто не смотрит.", "Аноним"),
+    ("Твоя история ещё пишется. Ты — автор.", "Аноним"),
+    ("Достаточно одного маленького шага вперёд каждый день.", "Аноним"),
+    ("Мудрость начинается с вопроса.", "Сократ"),
+    ("Единственный провал — не попробовать.", "Аноним"),
+    ("Стань тем изменением, которое хочешь видеть в мире.", "Махатма Ганди"),
+    ("Верь в себя — и ты уже на полпути.", "Теодор Рузвельт"),
+    ("Время уходит. Намерения остаются. Действуй сейчас.", "Аноним"),
+    ("Твои мысли формируют твою реальность.", "Аноним"),
+    ("Не бойся быть новичком. Все мастера когда-то им были.", "Аноним"),
+    ("Настойчивость побеждает таланты, которые не работают.", "Аноним"),
+    ("Хватит готовиться быть готовым. Начни.", "Аноним"),
+    ("Качество твоих вопросов определяет качество твоей жизни.", "Аноним"),
+    ("Делай что можешь, с тем что есть, там где ты есть.", "Теодор Рузвельт"),
+    ("Лучший момент посадить дерево — 20 лет назад. Второй лучший — сейчас.", "Китайская мудрость"),
+    ("Кто ясно мыслит — тот ясно действует.", "Аноним"),
+    ("Совершенство — враг готового. Заверши хоть что-то.", "Вольтер"),
+    ("Не жди вдохновения. Действие порождает вдохновение.", "Аноним"),
+    ("Ты сильнее, чем думаешь.", "Аноним"),
+    ("Смотри на проблему как на задачу — и она начнёт решаться.", "Аноним"),
+    ("Гибкость ума важнее жёсткости планов.", "Аноним"),
+    ("Привычки строят судьбу.", "Аноним"),
+    ("Успех любит скорость и конкретность.", "Аноним"),
+    ("Каждая трудность — тест на настоящие ценности.", "Аноним"),
+    ("Самая продуктивная вещь — знать, что не делать.", "Питер Друкер"),
+    ("Люби процесс — результат придёт сам.", "Аноним"),
+    ("Ты не обязан чувствовать себя готовым. Просто начни.", "Аноним"),
+    ("Сила не в том, чтобы не уставать, а в том, чтобы восстанавливаться.", "Аноним"),
+    ("Где внимание — там энергия. Направляй осознанно.", "Аноним"),
+    ("Честность с собой — начало любых перемен.", "Аноним"),
+    ("Маленькое последовательное действие меняет всё.", "Аноним"),
+    ("Лучшее инвестирование — в собственные навыки.", "Бенджамин Франклин"),
+    ("Жизнь измеряется не годами, а моментами присутствия.", "Аноним"),
+    ("Хаос снаружи начинается с хаоса внутри.", "Аноним"),
+    ("Каждый день выбирай рост.", "Аноним"),
+    ("Тот, кто движется медленно, но постоянно — приходит дальше.", "Аноним"),
+    ("Доверяй себе больше, чем обстоятельствам.", "Аноним"),
+    ("Перестань объяснять. Начни показывать результатами.", "Аноним"),
+    ("Измени свои мысли — и ты изменишь мир.", "Норман Пил"),
+    ("Выбор есть всегда. Даже ничего не делать — это выбор.", "Аноним"),
+    ("Один шаг вперёд — уже прогресс.", "Аноним"),
+    ("Всё великое начинается с малого и незаметного.", "Лао-Цзы"),
+    ("Тот, кто контролирует своё внимание — контролирует свою жизнь.", "Аноним"),
+    ("Страдание — необязательно. Рост — обязательно.", "Аноним"),
+    ("Настоящий успех — жить по своим ценностям.", "Аноним"),
+    ("Ошибка — это просто данные. Используй их.", "Аноним"),
+    ("Ничто великое не было сделано без энтузиазма.", "Ральф Уолдо Эмерсон"),
+    ("Сначала позаботься о себе. Потом ты сможешь позаботиться о других.", "Аноним"),
+    ("Жизнь даётся один раз — проживи её максимально.", "Аноним"),
+    ("В конце ты пожалеешь только о том, чего не сделал.", "Марк Твен"),
+    ("Радость — не в обладании, а в движении к цели.", "Аноним"),
+    ("Тяжело в учении — легко в бою.", "Александр Суворов"),
+    ("Самопознание — начало всякой мудрости.", "Аристотель"),
+]
 
 def get_conn():
     if TURSO_URL and TURSO_TOKEN:
@@ -75,6 +184,14 @@ def init_db():
         client_id TEXT,
         client_secret TEXT,
         scopes TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sent_quotes (
+        user_id INTEGER,
+        quote_idx INTEGER,
+        PRIMARY KEY (user_id, quote_idx))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS followup_queue (
+        user_id INTEGER PRIMARY KEY,
+        asked_at TEXT,
+        attempts INTEGER DEFAULT 0)""")
     conn.commit()
     if hasattr(conn, 'sync'): conn.sync()
     conn.close()
@@ -184,6 +301,154 @@ def get_user_tz_offset(profile):
 
 def user_now(profile):
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=get_user_tz_offset(profile))
+
+# ── Цитаты ────────────────────────────────────────────────────────────────────
+
+def get_random_quote(uid):
+    sent = {r[0] for r in db_fetch("SELECT quote_idx FROM sent_quotes WHERE user_id=?", (uid,))}
+    available = [i for i in range(len(QUOTES)) if i not in sent]
+    if not available:
+        db_exec("DELETE FROM sent_quotes WHERE user_id=?", (uid,))
+        available = list(range(len(QUOTES)))
+    idx = random.choice(available)
+    db_exec("INSERT OR IGNORE INTO sent_quotes (user_id, quote_idx) VALUES (?,?)", (uid, idx))
+    return QUOTES[idx]
+
+# ── Follow-up ─────────────────────────────────────────────────────────────────
+
+def set_followup(uid):
+    db_exec("INSERT OR REPLACE INTO followup_queue (user_id, asked_at, attempts) VALUES (?,?,0)",
+            (uid, datetime.now().isoformat()))
+
+def clear_followup(uid):
+    db_exec("DELETE FROM followup_queue WHERE user_id=?", (uid,))
+
+def get_pending_followups():
+    threshold = (datetime.now() - timedelta(hours=1)).isoformat()
+    return db_fetch("SELECT user_id, asked_at, attempts FROM followup_queue WHERE asked_at < ? AND attempts < 2",
+                    (threshold,))
+
+# ── Визуальные отчёты ─────────────────────────────────────────────────────────
+
+def generate_sphere_chart(uid):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        stats = get_sphere_stats(uid)
+        goals = get_goals(uid)
+
+        has_stats = bool(stats)
+        has_goals = bool(goals)
+        if not has_stats and not has_goals:
+            return None
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        fig.patch.set_facecolor('#1a1a2e')
+        for ax in axes:
+            ax.set_facecolor('#16213e')
+            ax.tick_params(colors='#e0e0e0')
+            ax.spines[:].set_color('#444')
+
+        if has_stats:
+            labels = [SPHERES.get(k, k).split()[-1] for k in stats.keys()]
+            values = list(stats.values())
+            bars = axes[0].barh(labels, values, color='#6C63FF', height=0.6)
+            axes[0].set_title('Активность по сферам (7 дней)', color='#e0e0e0', pad=10)
+            axes[0].set_xlabel('дней', color='#aaa')
+            for bar, val in zip(bars, values):
+                axes[0].text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
+                             str(val), va='center', color='#e0e0e0', fontsize=9)
+        else:
+            axes[0].text(0.5, 0.5, 'Нет данных', ha='center', va='center',
+                         color='#888', transform=axes[0].transAxes)
+            axes[0].set_title('Активность по сферам', color='#e0e0e0')
+
+        if has_goals:
+            goal_names = [(g[1][:18] + '…' if len(g[1]) > 18 else g[1]) for g in goals[:6]]
+            goal_vals = [g[4] for g in goals[:6]]
+            colors = ['#FF6584' if v < 30 else '#FFCA3A' if v < 70 else '#6BCB77' for v in goal_vals]
+            axes[1].barh(goal_names, goal_vals, color=colors, height=0.6)
+            axes[1].set_xlim(0, 100)
+            axes[1].set_title('Прогресс целей (%)', color='#e0e0e0', pad=10)
+            axes[1].set_xlabel('%', color='#aaa')
+            for i, val in enumerate(goal_vals):
+                axes[1].text(val + 1, i, f'{val}%', va='center', color='#e0e0e0', fontsize=9)
+        else:
+            axes[1].text(0.5, 0.5, 'Целей нет', ha='center', va='center',
+                         color='#888', transform=axes[1].transAxes)
+            axes[1].set_title('Прогресс целей', color='#e0e0e0')
+
+        plt.tight_layout(pad=2)
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        logging.error(f"Chart error: {e}")
+        return None
+
+def generate_pdf_report(uid):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+        from reportlab.lib import colors
+
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=40, leftMargin=40,
+                                topMargin=40, bottomMargin=40)
+        styles = getSampleStyleSheet()
+        h2 = ParagraphStyle('h2', parent=styles['Heading2'], textColor=colors.HexColor('#6C63FF'))
+        normal = styles['Normal']
+        story = []
+
+        profile = get_profile(uid)
+        name = profile.get("name", "Пользователь")
+        now = datetime.now()
+
+        story.append(Paragraph(f"Отчёт Nova — {name}", styles['Title']))
+        story.append(Paragraph(now.strftime('%d.%m.%Y'), normal))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#6C63FF')))
+        story.append(Spacer(1, 12))
+
+        tasks = get_tasks(uid)
+        story.append(Paragraph("📋 Открытые задачи", h2))
+        if tasks:
+            for t in tasks[:30]:
+                icon = {'urgent': '🔴', 'important': '🟡'}.get(t[2], '⚪')
+                story.append(Paragraph(f"{icon} {t[1]}", normal))
+        else:
+            story.append(Paragraph("Задач нет.", normal))
+        story.append(Spacer(1, 12))
+
+        goals = get_goals(uid)
+        story.append(Paragraph("🎯 Активные цели", h2))
+        if goals:
+            for g in goals:
+                progress = g[4] if len(g) > 4 else 0
+                bar = '█' * (progress // 10) + '░' * (10 - progress // 10)
+                story.append(Paragraph(f"• {g[1]}  [{bar}] {progress}%", normal))
+        else:
+            story.append(Paragraph("Целей нет.", normal))
+        story.append(Spacer(1, 12))
+
+        ideas = get_ideas(uid)
+        story.append(Paragraph("💡 Идеи", h2))
+        if ideas:
+            for i in ideas[:20]:
+                story.append(Paragraph(f"• {i[1]}", normal))
+        else:
+            story.append(Paragraph("Идей нет.", normal))
+
+        doc.build(story)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logging.error(f"PDF error: {e}")
+        return None
 
 def add_goal(uid, text, sphere="general", timeframe="longterm"):
     existing = db_fetch("SELECT id FROM goals WHERE user_id=? AND text=? AND done=0", (uid, text))
@@ -442,35 +707,28 @@ def format_dashboard(uid):
                 lines.append(f"  {SPHERES.get(s, s)}")
     return "\n".join(lines)
 
-ONBOARDING_INTRO = """👋 Привет! Я Нова — твой персональный ассистент.
+ONBOARDING_INTRO = """Привет! Я Нова — твой личный ассистент.
 
-Вот что я умею:
-📋 Принимаю все задачи, дела и планы — в любом формате
-🗓 Распределяю по времени и приоритетам
-🎯 Отслеживаю цели и сферы жизни
-💡 Храню идеи, мечты и желания
-🔔 Напоминаю и слежу за прогрессом
-🎤 Понимаю голосовые сообщения и фото
+Буду держать всё под контролем: задачи, планы, цели, идеи. Ты говоришь — я организую, напоминаю, помогаю двигаться вперёд.
 
-Моя главная задача — полностью разгрузить твою голову. Ты говоришь — я организую, планирую, напоминаю.
+Понимаю голосовые сообщения, фото, пересланные тексты. Подстраиваюсь под тебя.
 
-А теперь познакомимся поближе 🙂
-
-Буду задавать вопросы — отвечай как идёт, свободно. Если есть что добавить не по теме — тоже говори, я всё запомню и учту.
-
-Начнём? Как тебя зовут?"""
+Для начала — как тебя зовут?"""
 
 def build_system(profile, onboarding_mode=False):
-    p = ""
-    if profile.get("name"): p += f"Имя: {profile['name']}\n"
-    if profile.get("occupation"): p += f"Работа: {profile['occupation']}\n"
-    if profile.get("goals"): p += f"Цели: {profile['goals']}\n"
-    if profile.get("pain"): p += f"Что мешает: {profile['pain']}\n"
-    if profile.get("satisfied"): p += f"Что хорошо: {profile['satisfied']}\n"
-    if profile.get("day_rhythm"): p += f"Ритм дня: {profile['day_rhythm']}\n"
-    if profile.get("timezone"): p += f"Часовой пояс: {profile['timezone']}\n"
-    if profile.get("character"): p += f"Характер: {profile['character']}\n"
-    if profile.get("notes"): p += f"Заметки: {profile['notes']}\n"
+    address = profile.get("address") or profile.get("name") or ""
+    p_lines = []
+    if address: p_lines.append(f"Обращение: {address}")
+    if profile.get("occupation"): p_lines.append(f"Работа/деятельность: {profile['occupation']}")
+    if profile.get("goals"): p_lines.append(f"Жизненные цели: {profile['goals']}")
+    if profile.get("pain"): p_lines.append(f"Что мешает: {profile['pain']}")
+    if profile.get("satisfied"): p_lines.append(f"Что хорошо в жизни: {profile['satisfied']}")
+    if profile.get("day_rhythm"): p_lines.append(f"Ритм дня: {profile['day_rhythm']}")
+    if profile.get("timezone"): p_lines.append(f"Часовой пояс: {profile['timezone']}")
+    if profile.get("character"): p_lines.append(f"Характер/особенности: {profile['character']}")
+    if profile.get("notif_extras"): p_lines.append(f"Доп. блоки в уведомлениях: {profile['notif_extras']}")
+    if profile.get("notes"): p_lines.append(f"Заметки: {profile['notes']}")
+    profile_block = "\n".join(p_lines)
 
     now = user_now(profile)
     current_time = f"Сейчас: {now.strftime('%A, %d.%m.%Y, %H:%M')}"
@@ -478,82 +736,82 @@ def build_system(profile, onboarding_mode=False):
     onboarding_block = ""
     if onboarding_mode:
         onboarding_block = """
-РЕЖИМ ОНБОРДИНГА:
-Веди разговор как умный ассистент на первой встрече. Задавай вопросы по одному.
+РЕЖИМ ЗНАКОМСТВА:
+Это первый разговор. Веди его как умный, внимательный личный ассистент на первой встрече.
+Один вопрос за раз. Реагируй на ответы живо — цепляйся за детали, уточняй.
 
-БЛОК 1 — Знакомство:
-- Чем занимаешься? Работа, проекты, фриланс
-- Где больше всего нужна помощь прямо сейчас?
-- Есть привычные инструменты планирования или всё в голове?
-- В каком часовом поясе живёшь? (для правильного времени напоминаний)
+БЛОК 1 — Кто ты:
+- После имени сразу спроси: "Как тебя лучше называть — так же или по-другому?" → сохрани в [PROFILE: address=...]
+- Чем занимаешься? Работа, проекты, фриланс, учёба
+- В каком часовом поясе? (важно для уведомлений)
+- Как обычно планируешь — в голове, в приложениях, на бумаге?
 
-БЛОК 2 — Дела и планы:
-- Расскажи всё что сейчас висит в голове — задачи, дела, то что давно откладываешь
-- Есть срочные дела на ближайшие дни?
-- Какие планы на месяц?
+БЛОК 2 — Что сейчас висит:
+- Всё что сейчас в голове — дела, задачи, то что давно откладываешь
+- Есть срочное на ближайшие дни?
+- Что планируешь на этот месяц?
 
 БЛОК 3 — Сферы жизни:
 - Оцени от 1 до 10: работа, деньги, здоровье, отношения, развитие. Где хуже всего?
-- В какой сфере хочешь прогресс в первую очередь?
+- В какой сфере хочешь прогресс первым?
 
-БЛОК 4 — Мечты и идеи:
+БЛОК 4 — Цели и мечты:
 - Есть большая цель или мечта?
 - Что чаще всего мешает двигаться вперёд?
 - Есть идеи или желания которые давно лежат?
 
-Правила:
-- Один вопрос за раз
-- Цепляйся за детали, уточняй
-- Фиксируй: [PROFILE: ключ=значение]
-- Задачи фиксируй только если человек явно говорит что это задача
-- Идеи и мечты — всегда фиксируй: [IDEA: текст | сфера]
-- После всех блоков скажи что готова работать и предложи /done
+ПРАВИЛА ОНБОРДИНГА:
+- Фиксируй профиль: [PROFILE: ключ=значение]
+- Задачи — только если человек явно называет их задачами
+- Идеи, мечты — всегда: [IDEA: текст | сфера]
+- В конце: скажи что готова начать работу и предложи /done
 """
 
-    return f"""Ты — Нова. Персональный суперассистент по планированию, задачам и жизни.
+    return f"""Ты — Нова. Профессиональный личный ассистент.
 
 {current_time}
 
+ХАРАКТЕР И СТИЛЬ:
+- Дружелюбная, тёплая, вдумчивая. Говоришь о себе "я", никогда не звучишь как бот.
+- Не пишешь: "Конечно!", "Я понял!", "Как я могу помочь?" — только живые, человечные фразы.
+- Обращаешься к человеку по имени/обращению из профиля когда уместно.
+- Если человек пишет не на русском — отвечаешь на его языке.
+- Замечаешь настроение и состояние — реагируешь с заботой.
+- С каждым пользователем выстраиваешь персональные отношения на основе его профиля.
+
 ГЛАВНАЯ ЗАДАЧА:
-Разгружать голову человека. Принимать всё — задачи, планы, идеи — и превращать в чёткий план. Фиксировать, распределять, отслеживать, напоминать, перераспределять нагрузку.
+Разгружать голову. Принимать всё — задачи, идеи, планы — и превращать в чёткую структуру.
+Фиксировать, распределять, отслеживать, напоминать, помогать двигаться вперёд.
 
 ПРИОРИТЕТЫ:
-1. Планирование и задачи — основное
-2. Поддержка, советы, напоминания
-3. Сферы жизни — отслеживать
-4. Коучинг — только если человек просит
-
-ХАРАКТЕР:
-- Умная, живая, по делу
-- Не нянчишься — есть цель, идём к ней
-- Поддерживаешь и советуешь
-- Замечаешь перегруз — предлагаешь перераспределить
+1. Задачи и планирование — основное
+2. Поддержка и советы
+3. Сферы жизни — отслеживать баланс
+4. Коучинг и рефлексия — только если человек просит
 
 ФОРМАТИРОВАНИЕ (Telegram Markdown):
-- *жирный* для важного
-- _курсив_ для акцентов
-- Смайлики уместно, не в каждой строке
-- СТРОГО максимум 4 строки в сообщении. Никогда больше.
-- Без вступлений, сразу по делу
+- *жирный* для важного, _курсив_ для акцентов
+- Смайлики — уместно, не в каждой строке
+- СТРОГО не более 4 строк в одном сообщении
+- Без вступлений и предисловий — сразу по делу
 - Списки через • когда нужно перечислить
 
-ПРАВИЛО ПРО ЗАДАЧИ — ВАЖНО:
-- Человек явно говорит "надо сделать", "запиши", "добавь" → фиксируй сам
-- Человек рассуждает или делится мыслями → СПРОСИ: "Добавить это как задачу?"
-- Только после подтверждения добавляй
-- Идеи и мечты ("хотелось бы", "мечтаю", "было бы здорово") → всегда фиксируй как идею без вопроса
+ПРАВИЛО ПРО ЗАДАЧИ:
+- "надо сделать", "запиши", "добавь" → фиксируй сам
+- Человек рассуждает → спроси: "Добавить как задачу?"
+- "хотелось бы", "мечтаю", "было бы здорово" → всегда фиксируй как идею без вопроса
 
-РЕДАКТИРОВАНИЕ ЗАДАЧ:
-Если человек говорит "удали задачу 5" → [DEL_TASK: 5]
-Если "выполни задачу 3" → [DONE_TASK: 3]
-Если "перенеси задачу 2 на следующую неделю" → [EDIT_TASK: 2 | timeframe=week]
-Если "измени задачу 1 на новый текст" → [EDIT_TASK: 1 | text=новый текст]
+РЕДАКТИРОВАНИЕ:
+"удали задачу 5" → [DEL_TASK: 5]
+"выполни задачу 3" → [DONE_TASK: 3]
+"перенеси задачу 2 на неделю" → [EDIT_TASK: 2 | timeframe=week]
+"измени задачу 1" → [EDIT_TASK: 1 | text=новый текст]
+"прогресс по цели 4 — 60%" → [GOAL_PROGRESS: 4 | 60]
 
 ЗАМОРОЖЕННЫЕ ЭЛЕМЕНТЫ:
-Периодически поднимай идеи и цели которые давно лежат без движения.
-Предлагай запланировать или добавить в задачи.
+Когда уместно — поднимай идеи и цели без движения. Предлагай запланировать.
 
-ФИКСИРУЙ В КОНЦЕ (невидимо):
+ФИКСИРУЙ В КОНЦЕ ОТВЕТА (скрыто от пользователя):
 [TASK: текст | приоритет | сфера | timeframe]
 [GOAL: текст | сфера | timeframe]
 [IDEA: текст | сфера]
@@ -563,14 +821,12 @@ def build_system(profile, onboarding_mode=False):
 [EDIT_TASK: id | поле=значение]
 [GOAL_PROGRESS: id | процент]
 
-Если человек говорит о прогрессе по цели (сделал часть, продвинулся) → [GOAL_PROGRESS: id | 0-100]
-
+Приоритеты задач: urgent / important / normal
+Timeframe: today / week / month / longterm
 СФЕРЫ: {', '.join(SPHERES.values())}
 
 {onboarding_block}
-
-Отвечай на русском.
-{chr(10) + 'Профиль:' + chr(10) + p if p else ''}"""
+{chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
 
 async def call_claude(messages, system):
     headers = {
@@ -889,6 +1145,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    clear_followup(uid)
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
     audio_bytes = await file.download_as_bytearray()
@@ -908,13 +1165,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(history, system)
         clean = process_response(uid, response)
         save_msg(uid, "assistant", clean)
-        await send_safe(update, f"_Ты сказала:_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
+        if "?" in clean:
+            set_followup(uid)
+        await send_safe(update, f"_Ты сказал(а):_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
     except:
         await update.message.reply_text("Что-то пошло не так)")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    clear_followup(uid)
     await update.message.reply_text("Смотрю фото... 👀")
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
@@ -938,6 +1198,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    clear_followup(uid)
     doc = update.message.document
     if not doc.mime_type or not doc.mime_type.startswith('text'):
         await update.message.reply_text("Пока умею читать только текстовые файлы (.txt, .md)")
@@ -969,6 +1230,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    clear_followup(uid)
     text = update.message.text or update.message.caption or ""
     if not text:
         await update.message.reply_text("Пересланное сообщение без текста — не могу обработать(")
@@ -1036,6 +1298,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items_text = "\n".join([f"- {f[1]}" for f in frozen])
             system += f"\n\nЗамороженные идеи/цели (давно без движения):\n{items_text}\nЕсли уместно — предложи запланировать одну из них."
 
+    clear_followup(uid)
+
     history = get_history(uid)
     history.append({"role": "user", "content": text})
     save_msg(uid, "user", text)
@@ -1048,6 +1312,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     clean = process_response(uid, response)
     save_msg(uid, "assistant", clean)
+    if "?" in clean:
+        set_followup(uid)
     await send_safe(update, clean, main_keyboard() if onboarding_done else None)
 
 async def morning(context):
@@ -1058,18 +1324,49 @@ async def morning(context):
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
         if local_now.hour != 8:
             continue
-        name = profile.get("name", "")
+        address = profile.get("address") or profile.get("name") or ""
         today_tasks = get_today_tasks(uid)
         urgent = get_tasks(uid, priority="urgent")
-        msg = f"☀️ Доброе утро, {name}!\n{local_now.strftime('%d.%m.%Y')}\n\n"
+        goals = get_goals(uid)
+        quote_text, quote_author = get_random_quote(uid)
+        notif_extras = profile.get("notif_extras", "")
+
+        task_block = ""
         if today_tasks:
-            msg += f"📅 На сегодня: {len(today_tasks)} задач\n"
-            for t in today_tasks[:3]: msg += f"• {t[1]}\n"
-        if urgent:
-            msg += f"\n🔴 Срочных: {len(urgent)}"
-        msg += "\n\nКак ты? 🙂"
-        try: await context.bot.send_message(uid, msg)
-        except: pass
+            task_block = f"Задачи на сегодня:\n" + "\n".join([f"• {t[1]}" for t in today_tasks[:5]])
+        elif urgent:
+            task_block = f"Срочных задач: {len(urgent)}"
+
+        goal_block = ""
+        if goals:
+            goal_block = "Активных целей: " + str(len(goals))
+
+        system = build_system(profile)
+        prompt = f"""Сгенерируй утреннее уведомление для пользователя. Используй эти данные:
+
+Обращение: {address}
+Дата: {local_now.strftime('%d.%m.%Y, %A')}
+Цитата дня: «{quote_text}» — {quote_author}
+{task_block}
+{goal_block}
+{f"Дополнительно включи: {notif_extras}" if notif_extras else ""}
+
+Структура:
+1. Тёплое приветствие с датой
+2. Цитата дня — выдели курсивом, подпись автора
+3. Один вопрос для самоанализа на сегодня (связан с целями или ситуацией пользователя)
+4. Задачи на сегодня (если есть)
+5. Короткое напутствие
+
+Стиль: живой, тёплый, не формальный. Не больше 10 строк суммарно."""
+
+        try:
+            response = await call_claude([{"role": "user", "content": prompt}], system)
+            await context.bot.send_message(uid, response, parse_mode="Markdown")
+            save_msg(uid, "assistant", response)
+            set_followup(uid)
+        except Exception as e:
+            logging.error(f"Morning notif error {uid}: {e}")
 
 async def evening(context):
     utc_now = datetime.now(timezone.utc)
@@ -1079,17 +1376,40 @@ async def evening(context):
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
         if local_now.hour != 19:
             continue
-        name = profile.get("name", "")
+        address = profile.get("address") or profile.get("name") or ""
         tasks = get_tasks(uid)
+        done_today = db_fetch("""SELECT text FROM tasks WHERE user_id=? AND done=1
+                                  AND created_at >= date('now', '-1 day')""", (uid,))
         stats = get_sphere_stats(uid)
         inactive = set(SPHERE_KEYS) - set(stats.keys())
-        msg = f"🌙 Привет, {name}) как прошёл день?\n\n"
-        if tasks: msg += f"📌 Открытых задач: {len(tasks)}\n"
-        if inactive:
-            labels = [SPHERES[s] for s in list(inactive)[:2]]
-            msg += f"Сегодня не касалась: {', '.join(labels)}"
-        try: await context.bot.send_message(uid, msg)
-        except: pass
+
+        system = build_system(profile)
+        inactive_labels = ", ".join([SPHERES[s] for s in list(inactive)[:3]]) if inactive else ""
+        done_block = "\n".join([f"• {t[0]}" for t in done_today[:5]]) if done_today else "Нет данных"
+
+        prompt = f"""Сгенерируй вечернее уведомление для пользователя.
+
+Обращение: {address}
+Выполнено сегодня: {done_block}
+Открытых задач осталось: {len(tasks)}
+Сферы без внимания сегодня: {inactive_labels or 'все активны'}
+
+Структура:
+1. Тёплое вечернее приветствие
+2. Короткий итог дня — что сделано (не перечисляй всё, обобщи)
+3. Один вопрос для рефлексии — что дал этот день, что можно было сделать иначе
+4. Одно намерение или фокус на завтра
+5. Тёплое завершение — не сухое
+
+Стиль: мягкий, заботливый, человечный. Не более 8 строк."""
+
+        try:
+            response = await call_claude([{"role": "user", "content": prompt}], system)
+            await context.bot.send_message(uid, response, parse_mode="Markdown")
+            save_msg(uid, "assistant", response)
+            set_followup(uid)
+        except Exception as e:
+            logging.error(f"Evening notif error {uid}: {e}")
 
 async def weekly_review(context):
     utc_now = datetime.now(timezone.utc)
@@ -1099,19 +1419,89 @@ async def weekly_review(context):
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
         if local_now.hour != 10 or local_now.weekday() != 6:
             continue
-        name = profile.get("name", "")
+        address = profile.get("address") or profile.get("name") or ""
         tasks = get_tasks(uid)
         goals = get_goals(uid)
         frozen = get_frozen_items(uid)
-        msg = f"📋 Еженедельный обзор, {name}!\n\n"
-        msg += f"Открытых задач: {len(tasks)}\n"
-        msg += f"Активных целей: {len(goals)}\n"
-        if frozen:
-            msg += f"\n💡 Давно лежат без движения:\n"
-            for f in frozen[:3]: msg += f"• {f[1]}\n"
-            msg += "\nМожет пора запланировать что-то из этого?"
-        try: await context.bot.send_message(uid, msg)
-        except: pass
+        stats = get_sphere_stats(uid)
+
+        goals_block = "\n".join([f"• {g[1]} — {g[4]}%" for g in goals[:6]]) if goals else "Целей нет"
+        stats_block = "\n".join([f"• {SPHERES.get(k,k)}: {v} дн." for k,v in stats.items()]) if stats else "Нет данных"
+        frozen_block = "\n".join([f"• {f[1]}" for f in frozen[:3]]) if frozen else ""
+
+        system = build_system(profile)
+        prompt = f"""Сгенерируй еженедельный обзор для пользователя.
+
+Обращение: {address}
+Неделя: {(local_now - timedelta(days=6)).strftime('%d.%m')} — {local_now.strftime('%d.%m.%Y')}
+Открытых задач: {len(tasks)}
+Прогресс целей:
+{goals_block}
+Активность по сферам за неделю:
+{stats_block}
+{f"Давно без движения:{chr(10)}{frozen_block}" if frozen_block else ""}
+
+Структура:
+1. Приветствие с неделей
+2. Итоги по сферам — что активно, что игнорируется
+3. Прогресс целей — честно и поддерживающе
+4. Планы и фокус на следующую неделю
+5. Если есть замороженные — мягко поднять
+6. Завершение — вдохновляющее
+
+Стиль: глубже обычного, аналитично но по-человечески. Не более 12 строк."""
+
+        try:
+            response = await call_claude([{"role": "user", "content": prompt}], system)
+
+            # Отправляем график перед текстом
+            chart = generate_sphere_chart(uid)
+            if chart:
+                await context.bot.send_photo(uid, photo=chart,
+                    caption="📊 Прогресс по сферам и целям за неделю")
+
+            await context.bot.send_message(uid, response, parse_mode="Markdown")
+            save_msg(uid, "assistant", response)
+
+            # Предлагаем PDF
+            await context.bot.send_message(uid, "Хочешь подробный PDF отчёт? Напиши /report")
+        except Exception as e:
+            logging.error(f"Weekly review error {uid}: {e}")
+
+async def check_followup(context):
+    pending = get_pending_followups()
+    for uid, asked_at, attempts in pending:
+        profile = get_profile(uid)
+        history = get_history(uid, limit=6)
+        system = build_system(profile)
+        try:
+            response = await call_claude(
+                history + [{"role": "user", "content":
+                    "Я не ответил на твой последний вопрос. Переформулируй его иначе — коротко, с другой стороны. "
+                    "Не упоминай что я молчал."}],
+                system)
+            clean = process_response(uid, response)
+            await context.bot.send_message(uid, clean, parse_mode="Markdown")
+            db_exec("UPDATE followup_queue SET asked_at=?, attempts=? WHERE user_id=?",
+                    (datetime.now().isoformat(), attempts + 1, uid))
+        except Exception as e:
+            logging.error(f"Followup error {uid}: {e}")
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text("Генерирую отчёт... 📊")
+    chart = generate_sphere_chart(uid)
+    if chart:
+        await context.bot.send_photo(uid, photo=chart, caption="📊 Прогресс по сферам и целям")
+    else:
+        await update.message.reply_text("Нет данных для графика — добавь задачи и цели.")
+    pdf = generate_pdf_report(uid)
+    if pdf:
+        await context.bot.send_document(uid, document=pdf, filename="nova_report.pdf",
+                                        caption="📄 Подробный отчёт")
+    else:
+        await update.message.reply_text("PDF недоступен (библиотека reportlab не установлена).",
+                                        reply_markup=main_keyboard())
 
 from aiohttp import web
 
@@ -1151,6 +1541,7 @@ def main():
     app.add_handler(CommandHandler("focus", cmd_focus))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CommandHandler("calendar", cmd_calendar))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -1160,6 +1551,7 @@ def main():
     jq.run_repeating(morning, interval=3600, first=60)
     jq.run_repeating(evening, interval=3600, first=120)
     jq.run_repeating(weekly_review, interval=3600, first=180)
+    jq.run_repeating(check_followup, interval=1800, first=300)
 
     async def start_web(app_obj):
         web_app = web.Application()
