@@ -720,7 +720,7 @@ ONBOARDING_INTRO = """Привет! Я Нова — твой личный асс
 📍 Этап 4 — Всё что есть прямо сейчас
 📍 Этап 5 — Цели, мечты, идеи
 
-Готов начать? 🚀"""
+Поехали — узнаем друг друга! 🚀"""
 
 def build_system(profile, onboarding_mode=False):
     address = profile.get("address") or profile.get("name") or ""
@@ -998,6 +998,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await query.edit_message_text(text, reply_markup=kb)
 
+    if data == "onboarding_start":
+        update_user(uid, onboarding_step=1)
+        profile = get_profile(uid)
+        system = build_system(profile, onboarding_mode=True)
+        try:
+            response = await call_claude(
+                get_history(uid) + [{"role": "user", "content": "Начинаем! Старт этапа 1."}],
+                system)
+            clean = process_response(uid, response)
+            save_msg(uid, "user", "Начинаем!")
+            save_msg(uid, "assistant", clean)
+            await query.edit_message_text(clean, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Onboarding start error: {e}")
+            await query.edit_message_text("Отлично, начнём! Как тебя зовут и как к тебе обращаться?")
+        return
     if data == "back_main":
         await edit("Главное меню 👇"); return
     if data == "back_spheres":
@@ -1075,8 +1091,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = profile.get("name", "")
         await send_safe(update, f"Я здесь, {name} 👋" if name else "Я здесь 👋", main_keyboard())
     else:
-        update_user(uid, onboarding_step=1)
-        await send_safe(update, ONBOARDING_INTRO)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Поехали!", callback_data="onboarding_start")]])
+        await update.message.reply_text(ONBOARDING_INTRO, reply_markup=kb)
         save_msg(uid, "assistant", ONBOARDING_INTRO)
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
