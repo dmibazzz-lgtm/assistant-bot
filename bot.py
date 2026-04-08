@@ -213,6 +213,39 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         asked_at TEXT,
         attempts INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS mood_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        score INTEGER,
+        note TEXT,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS energy_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        score INTEGER,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS habits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        active INTEGER DEFAULT 1,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS habit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        habit_id INTEGER,
+        log_date TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        question TEXT,
+        entry TEXT,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS wins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        text TEXT,
+        created_at TEXT)""")
     conn.commit()
     if hasattr(conn, 'sync'): conn.sync()
     conn.close()
@@ -322,6 +355,62 @@ def get_user_tz_offset(profile):
 
 def user_now(profile):
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=get_user_tz_offset(profile))
+
+REFLECT_QUESTIONS = [
+    "Чего ты сейчас больше всего избегаешь — и почему?",
+    "Если бы твой лучший друг описал тебя незнакомцу, что бы он сказал?",
+    "Что ты делаешь из страха, а не из желания?",
+    "Какое решение ты откладываешь уже давно?",
+    "Что ты хотел бы простить себе?",
+    "Назови три вещи, которые тебя по-настоящему заряжают.",
+    "Что бы ты сделал, если бы знал что не провалишься?",
+    "Какую версию себя ты строишь прямо сейчас?",
+    "Что ты делаешь на автопилоте — и стоит ли это менять?",
+    "Когда ты последний раз делал что-то впервые?",
+    "Что ты хочешь, чтобы люди чувствовали рядом с тобой?",
+    "Чем ты гордишься, но никому не говоришь?",
+    "Что для тебя значит 'достаточно хорошо'?",
+    "Какие убеждения о себе тебе мешают?",
+    "Что ты перестал делать, но скучаешь по этому?",
+    "Где ты живёшь не своей жизнью?",
+    "Что ты готов защищать даже под давлением?",
+    "Если через 5 лет оглянешься — о чём не пожалеешь?",
+    "Что ты говоришь себе когда всё идёт не так?",
+    "Кто ты без своих ролей — без работы, без статуса, без отношений?",
+    "Что тебе даёт ощущение смысла?",
+    "Когда ты последний раз был полностью честен с собой?",
+    "Что ты хочешь создать в этом мире?",
+    "Каким человеком хочет стать тот ты, которого ты сейчас строишь?",
+    "Что ты не говоришь вслух, но думаешь постоянно?",
+    "Назови одну привычку, которая тебя держит назад.",
+    "Что значит для тебя успех — не чужой, а твой?",
+    "Что ты чувствуешь, когда делаешь что-то для других?",
+    "Где граница между заботой о себе и эгоизмом для тебя?",
+    "Что ты изменил бы в прошлом — и изменил бы на самом деле?",
+    "Как ты справляешься с неопределённостью?",
+    "Что тебя вдохновляло в детстве — и живо ли это сейчас?",
+    "Когда ты чувствуешь себя по-настоящему живым?",
+    "Что ты принимаешь в себе с трудом?",
+    "Где в твоей жизни больше всего хаоса — и почему?",
+    "Что ты делаешь хорошо, но обесцениваешь?",
+    "Какой ты в отношениях с людьми которые тебя не знают?",
+    "Что тебя останавливает чаще всего?",
+    "Как ты относишься к своим ошибкам?",
+    "Что ты ищешь в других людях — и есть ли это в тебе самом?",
+    "Если бы ты мог поговорить с собой 10-летней давности — что бы сказал?",
+    "Что тебе нужно услышать прямо сейчас?",
+    "Где ты застрял — и что не даёт сдвинуться?",
+    "Что ты называешь 'реализмом', а на деле это страх?",
+    "Когда ты последний раз просил о помощи?",
+    "Что для тебя важнее — быть правым или быть счастливым?",
+    "Назови три вещи, которые ты хочешь отпустить.",
+    "Что ты будешь помнить об этом периоде жизни через 20 лет?",
+    "Как ты относишься к своему телу — как к другу или врагу?",
+    "Что ты не позволяешь себе хотеть?",
+    "Где в твоей жизни есть несоответствие между словами и делами?",
+    "Что ты делаешь когда никто не видит?",
+    "Какой вопрос ты боишься себе задать?",
+]
 
 # ── Цитаты ────────────────────────────────────────────────────────────────────
 
@@ -470,6 +559,164 @@ def generate_pdf_report(uid):
     except Exception as e:
         logging.error(f"PDF error: {e}")
         return None
+
+# ── Mood / Energy / Habits / Journal / Wins ───────────────────────────────────
+
+def log_mood(uid, score, note=""):
+    db_exec("INSERT INTO mood_log (user_id,score,note,created_at) VALUES (?,?,?,?)",
+            (uid, score, note, datetime.now().isoformat()))
+
+def get_mood_history(uid, days=14):
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    return db_fetch("SELECT score,note,created_at FROM mood_log WHERE user_id=? AND created_at>=? ORDER BY created_at",
+                    (uid, cutoff))
+
+def log_energy(uid, score):
+    db_exec("INSERT INTO energy_log (user_id,score,created_at) VALUES (?,?,?)",
+            (uid, score, datetime.now().isoformat()))
+
+def get_energy_history(uid, days=14):
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    return db_fetch("SELECT score,created_at FROM energy_log WHERE user_id=? AND created_at>=? ORDER BY created_at",
+                    (uid, cutoff))
+
+def get_or_create_habit(uid, name):
+    existing = db_fetchone("SELECT id FROM habits WHERE user_id=? AND name=? AND active=1", (uid, name))
+    if existing: return existing[0]
+    db_exec("INSERT INTO habits (user_id,name,active,created_at) VALUES (?,?,1,?)",
+            (uid, name, datetime.now().isoformat()))
+    return db_fetchone("SELECT id FROM habits WHERE user_id=? AND name=? AND active=1", (uid, name))[0]
+
+def get_habits(uid):
+    return db_fetch("SELECT id,name FROM habits WHERE user_id=? AND active=1 ORDER BY id", (uid,))
+
+def mark_habit_today(uid, habit_id):
+    today = datetime.now().date().isoformat()
+    existing = db_fetchone("SELECT id FROM habit_log WHERE user_id=? AND habit_id=? AND log_date=?",
+                           (uid, habit_id, today))
+    if not existing:
+        db_exec("INSERT INTO habit_log (user_id,habit_id,log_date) VALUES (?,?,?)", (uid, habit_id, today))
+
+def get_habit_streak(uid, habit_id):
+    rows = db_fetch("SELECT log_date FROM habit_log WHERE user_id=? AND habit_id=? ORDER BY log_date DESC",
+                    (uid, habit_id))
+    if not rows: return 0
+    streak = 0
+    check = datetime.now().date()
+    for (d,) in rows:
+        if d == check.isoformat():
+            streak += 1
+            check -= timedelta(days=1)
+        else:
+            break
+    return streak
+
+def save_journal(uid, question, entry):
+    db_exec("INSERT INTO journal (user_id,question,entry,created_at) VALUES (?,?,?,?)",
+            (uid, question, entry, datetime.now().isoformat()))
+
+def get_journal_entries(uid, limit=5):
+    return db_fetch("SELECT question,entry,created_at FROM journal WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                    (uid, limit))
+
+def add_win(uid, text):
+    db_exec("INSERT INTO wins (user_id,text,created_at) VALUES (?,?,?)",
+            (uid, text, datetime.now().isoformat()))
+
+def get_wins(uid, limit=10):
+    return db_fetch("SELECT text,created_at FROM wins WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                    (uid, limit))
+
+# ── Колесо жизни ──────────────────────────────────────────────────────────────
+
+def generate_wheel_chart(uid):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        profile = get_profile(uid)
+        spheres_score_str = profile.get("spheres_score", "")
+        scores = {}
+        if spheres_score_str:
+            for pair in spheres_score_str.split(","):
+                if ":" in pair:
+                    k, v = pair.strip().split(":", 1)
+                    try: scores[k.strip()] = int(v.strip())
+                    except: pass
+
+        labels_map = {
+            "работа": "Работа", "финансы": "Финансы", "здоровье": "Здоровье",
+            "отношения": "Отношения", "семья": "Семья", "саморазвитие": "Развитие",
+            "творчество": "Творчество", "отдых": "Отдых",
+            "духовность": "Духовность", "окружение": "Окружение",
+        }
+        keys = list(labels_map.keys())
+        values = [scores.get(k, 5) for k in keys]
+        labels = [labels_map[k] for k in keys]
+        N = len(labels)
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+        values_plot = values + [values[0]]
+        angles += angles[:1]
+
+        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+        fig.patch.set_facecolor('#1a1a2e')
+        ax.set_facecolor('#16213e')
+        ax.plot(angles, values_plot, 'o-', linewidth=2, color='#6C63FF')
+        ax.fill(angles, values_plot, alpha=0.25, color='#6C63FF')
+        ax.set_ylim(0, 10)
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(labels, color='#e0e0e0', fontsize=9)
+        ax.tick_params(colors='#aaa')
+        ax.yaxis.set_tick_params(labelcolor='#666')
+        ax.spines['polar'].set_color('#444')
+        ax.set_title('Колесо жизни', color='#e0e0e0', pad=15)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        logging.error(f"Wheel chart error: {e}")
+        return None
+
+# ── Инлайн-клавиатуры для трекеров ───────────────────────────────────────────
+
+def score_keyboard(prefix):
+    row1 = [InlineKeyboardButton(str(i), callback_data=f"{prefix}_{i}") for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(str(i), callback_data=f"{prefix}_{i}") for i in range(6, 11)]
+    return InlineKeyboardMarkup([row1, row2])
+
+def habits_keyboard(uid):
+    habits = get_habits(uid)
+    today = datetime.now().date().isoformat()
+    rows = []
+    for hid, hname in habits:
+        done = db_fetchone("SELECT id FROM habit_log WHERE user_id=? AND habit_id=? AND log_date=?",
+                           (uid, hid, today))
+        mark = "✅" if done else "⬜"
+        streak = get_habit_streak(uid, hid)
+        label = f"{mark} {hname}" + (f" 🔥{streak}" if streak > 1 else "")
+        rows.append([InlineKeyboardButton(label, callback_data=f"habit_toggle_{hid}")])
+    rows.append([InlineKeyboardButton("➕ Добавить привычку", callback_data="habit_add")])
+    return InlineKeyboardMarkup(rows)
+
+def settings_keyboard(profile):
+    notif_morning = profile.get("notif_morning", "1") != "0"
+    notif_evening = profile.get("notif_evening", "1") != "0"
+    notif_weekly  = profile.get("notif_weekly",  "1") != "0"
+    style = profile.get("info_style", "detailed")
+    feedback = profile.get("feedback_style", "soft")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'🔔' if notif_morning else '🔕'} Утро", callback_data="set_morning"),
+         InlineKeyboardButton(f"{'🔔' if notif_evening else '🔕'} Вечер", callback_data="set_evening"),
+         InlineKeyboardButton(f"{'🔔' if notif_weekly  else '🔕'} Неделя", callback_data="set_weekly")],
+        [InlineKeyboardButton(f"Стиль: {'кратко' if style=='brief' else 'подробно'}", callback_data="set_style"),
+         InlineKeyboardButton(f"Тон: {'прямой' if feedback=='direct' else 'мягкий'}", callback_data="set_feedback")],
+        [InlineKeyboardButton("🕐 Изменить часовой пояс", callback_data="set_tz")],
+    ])
 
 def add_goal(uid, text, sphere="general", timeframe="longterm"):
     existing = db_fetch("SELECT id FROM goals WHERE user_id=? AND text=? AND done=0", (uid, text))
@@ -1104,6 +1351,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ideas = get_ideas(uid, sphere=sk)
         text = f"{SPHERES.get(sk)} — идеи:\n\n" + ("\n".join([f"• {i[1]}" for i in ideas]) if ideas else "Пусто 👌")
         await edit(text, sphere_detail_keyboard(sk)); return
+    if data.startswith("mood_"):
+        score = int(data.split("_")[1])
+        log_mood(uid, score)
+        profile = get_profile(uid)
+        hist = get_mood_history(uid, days=7)
+        avg = round(sum(r[0] for r in hist) / len(hist), 1) if hist else score
+        comment = ""
+        if len(hist) >= 3:
+            trend = hist[-1][0] - hist[0][0]
+            if trend > 2: comment = " Заметный рост за неделю 📈"
+            elif trend < -2: comment = " Сдаёт немного — следи за собой 💛"
+        await edit(f"Записала настроение: *{score}/10*{comment}\nСредний за неделю: {avg}/10")
+        return
+    if data.startswith("energy_"):
+        score = int(data.split("_")[1])
+        log_energy(uid, score)
+        hist = get_energy_history(uid, days=7)
+        avg = round(sum(r[0] for r in hist) / len(hist), 1) if hist else score
+        await edit(f"Записала энергию: *{score}/10*\nСредняя за неделю: {avg}/10")
+        return
+    if data.startswith("habit_toggle_"):
+        hid = int(data.replace("habit_toggle_", ""))
+        mark_habit_today(uid, hid)
+        await query.edit_message_reply_markup(reply_markup=habits_keyboard(uid))
+        return
+    if data == "habit_add":
+        await edit("Напиши название привычки которую хочешь добавить:")
+        context.user_data["mode"] = "habit_add"
+        return
+    if data in ("set_morning", "set_evening", "set_weekly"):
+        key = {"set_morning": "notif_morning", "set_evening": "notif_evening", "set_weekly": "notif_weekly"}[data]
+        profile = get_profile(uid)
+        current = profile.get(key, "1")
+        profile[key] = "0" if current != "0" else "1"
+        save_profile(uid, profile)
+        await query.edit_message_reply_markup(reply_markup=settings_keyboard(profile))
+        return
+    if data == "set_style":
+        profile = get_profile(uid)
+        profile["info_style"] = "brief" if profile.get("info_style", "detailed") == "detailed" else "detailed"
+        save_profile(uid, profile)
+        await query.edit_message_reply_markup(reply_markup=settings_keyboard(profile))
+        return
+    if data == "set_feedback":
+        profile = get_profile(uid)
+        profile["feedback_style"] = "direct" if profile.get("feedback_style", "soft") == "soft" else "soft"
+        save_profile(uid, profile)
+        await query.edit_message_reply_markup(reply_markup=settings_keyboard(profile))
+        return
+    if data == "set_tz":
+        await edit("Напиши своё текущее время — например '15:30' или '9 утра'. Я вычислю часовой пояс.")
+        context.user_data["mode"] = "set_tz"
+        return
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1235,6 +1535,189 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_safe(update, clean, main_keyboard())
     except:
         await update.message.reply_text("Как ты сейчас? 🙂", reply_markup=main_keyboard())
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """*Нова — твой личный ассистент* 🤖
+
+*📋 Задачи и планирование*
+/today — задачи на сегодня
+/week — план на неделю
+/month — задачи на месяц
+/focus — самая важная задача прямо сейчас
+/brain — выгрузи всё из головы, я разберу
+
+*🎯 Цели и развитие*
+/goals — цели и прогресс в %
+/wins — твои победы и достижения
+/review — ежемесячный разбор прогресса
+
+*💡 Идеи и рефлексия*
+/ideas — идеи и желания
+/reflect — вопрос для самоанализа
+/ask — честный коучинговый ответ
+/journal — личный дневник
+
+*🌀 Трекеры*
+/mood — настроение
+/energy — уровень энергии
+/habits — трекер привычек
+/sphere — колесо жизни по сферам
+
+*🔧 Настройки*
+/checkin — чекин состояния
+/profile — мой профиль
+/settings — уведомления, часовой пояс, стиль
+/calendar — Google Календарь
+/report — отчёт, графики, PDF
+
+Пишу в любом формате — текст, голос, фото 🎤📸"""
+    await send_safe(update, text, main_keyboard())
+
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tasks = get_tasks(uid, timeframe="month")
+    await send_safe(update, f"🗓 *На месяц:*\n\n{format_tasks(tasks)}", main_keyboard())
+
+async def cmd_sphere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = get_profile(uid)
+    spheres_score = profile.get("spheres_score", "")
+    if spheres_score:
+        lines = ["*🌀 Колесо жизни:*\n"]
+        for pair in spheres_score.split(","):
+            if ":" in pair:
+                k, v = pair.strip().split(":", 1)
+                bar = "█" * int(v.strip()) + "░" * (10 - int(v.strip()))
+                lines.append(f"{k.strip().capitalize()}: {bar} {v.strip()}/10")
+        chart = generate_wheel_chart(uid)
+        if chart:
+            await context.bot.send_photo(uid, photo=chart)
+        await send_safe(update, "\n".join(lines) + "\n\nОбновить оценки? Просто напиши мне новые.", main_keyboard())
+    else:
+        await send_safe(update, "Оценки по сферам ещё не заполнены. Пройди /start чтобы заполнить колесо жизни, или напиши мне оценки в свободной форме.", main_keyboard())
+
+async def cmd_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    q = random.choice(REFLECT_QUESTIONS)
+    profile = get_profile(uid)
+    address = profile.get("address") or profile.get("name") or ""
+    prefix = f"{address}, " if address else ""
+    await send_safe(update, f"🪞 *Вопрос для размышления:*\n\n_{prefix}{q}_", main_keyboard())
+    set_followup(uid)
+
+async def cmd_wins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    wins = get_wins(uid)
+    if wins:
+        lines = ["*🏆 Твои победы:*\n"]
+        for w in wins:
+            dt = w[1][:10] if w[1] else ""
+            lines.append(f"• {w[0]}" + (f" _{dt}_" if dt else ""))
+        await send_safe(update, "\n".join(lines), main_keyboard())
+    else:
+        await send_safe(update, "Побед пока нет — но это ненадолго 💪\nНапиши мне о любом своём достижении, я сохраню.", main_keyboard())
+
+async def cmd_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Как твоё настроение сейчас? Выбери от 1 до 10:",
+        reply_markup=score_keyboard("mood"))
+
+async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    habits = get_habits(uid)
+    if not habits:
+        await send_safe(update, "Привычек пока нет. Напиши мне какую привычку хочешь отслеживать — я добавлю.", main_keyboard())
+        return
+    await update.message.reply_text("*📌 Трекер привычек — сегодня:*",
+                                     parse_mode="Markdown", reply_markup=habits_keyboard(uid))
+
+async def cmd_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Уровень энергии сейчас — от 1 до 10:",
+        reply_markup=score_keyboard("energy"))
+
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = get_profile(uid)
+    system = build_system(profile)
+    entries = get_journal_entries(uid, limit=3)
+    context_block = ""
+    if entries:
+        context_block = "\nПоследние записи:\n" + "\n".join([f"— {e[0]}: {e[1][:60]}…" for e in entries])
+    try:
+        response = await call_claude(
+            [{"role": "user", "content": f"Задай один глубокий вопрос для дневниковой записи. Учитывай профиль.{context_block}"}],
+            system, model=MODEL_SMART)
+        context.user_data["journal_question"] = response
+        await send_safe(update, f"📔 *Дневник*\n\n{response}", None)
+    except:
+        q = "Что сегодня было для тебя самым значимым?"
+        context.user_data["journal_question"] = q
+        await send_safe(update, f"📔 *Дневник*\n\n{q}", None)
+
+async def cmd_brain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_safe(update,
+        "🧠 *Выгрузка мыслей*\n\nПиши всё подряд — дела, идеи, тревоги, планы, случайные мысли. Не фильтруй. Я сама разберу по категориям.",
+        None)
+    context.user_data["mode"] = "brain"
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_safe(update,
+        "🔍 *Честный анализ*\n\nЗадай мне вопрос о себе — и я отвечу честно, как зеркало. Без лишней мягкости.",
+        None)
+    context.user_data["mode"] = "ask"
+
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = get_profile(uid)
+    tasks = get_tasks(uid)
+    goals = get_goals(uid)
+    mood_hist = get_mood_history(uid, days=30)
+    energy_hist = get_energy_history(uid, days=30)
+    stats = get_sphere_stats(uid)
+
+    avg_mood = round(sum(r[0] for r in mood_hist) / len(mood_hist), 1) if mood_hist else "нет данных"
+    avg_energy = round(sum(r[0] for r in energy_hist) / len(energy_hist), 1) if energy_hist else "нет данных"
+    goals_block = "\n".join([f"• {g[1]} — {g[4]}%" for g in goals[:5]]) if goals else "нет"
+    stats_block = ", ".join([f"{k}: {v}д" for k, v in list(stats.items())[:5]]) if stats else "нет данных"
+
+    system = build_system(profile)
+    prompt = f"""Сделай ежемесячный разбор для пользователя.
+
+Открытых задач: {len(tasks)}
+Активных целей:\n{goals_block}
+Ср. настроение за месяц: {avg_mood}/10
+Ср. энергия за месяц: {avg_energy}/10
+Активность по сферам: {stats_block}
+
+Структура:
+1. Что работает — честно и конкретно
+2. Что не работает — без осуждения
+3. Паттерны которые ты замечаешь
+4. Одна главная рекомендация на следующий месяц
+5. Короткое вдохновляющее завершение
+
+Стиль: глубокий, честный, поддерживающий."""
+
+    await update.message.reply_text("Готовлю ежемесячный разбор... 📊")
+    try:
+        response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
+        chart = generate_sphere_chart(uid)
+        if chart:
+            await context.bot.send_photo(uid, photo=chart, caption="📊 Активность и прогресс")
+        await send_safe(update, response, main_keyboard())
+    except Exception as e:
+        logging.error(f"Review error: {e}")
+        await update.message.reply_text("Что-то пошло не так(", reply_markup=main_keyboard())
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = get_profile(uid)
+    tz = profile.get("timezone", "не задан")
+    style = "подробно" if profile.get("info_style", "detailed") == "detailed" else "кратко"
+    feedback = "мягкий" if profile.get("feedback_style", "soft") == "soft" else "прямой"
+    text = f"*⚙️ Настройки*\n\nЧасовой пояс: {tz}\nСтиль ответов: {style}\nТон: {feedback}"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=settings_keyboard(profile))
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1392,6 +1875,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items_text = "\n".join([f"- {f[1]}" for f in frozen])
             system += f"\n\nЗамороженные идеи/цели (давно без движения):\n{items_text}\nЕсли уместно — предложи запланировать одну из них."
 
+    # Секретные команды сброса
+    if text.strip().lower() in ("полный сброс", "full reset"):
+        for t in ["users","messages","tasks","goals","ideas","sphere_activity","google_tokens",
+                  "mood_log","energy_log","habits","habit_log","journal","wins","sent_quotes","followup_queue"]:
+            db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
+        await update.message.reply_text("Полный сброс выполнен. Напиши /start")
+        return
+    if text.strip().lower() == "сброс истории":
+        clear_history(uid)
+        await update.message.reply_text("История диалога очищена.", reply_markup=main_keyboard())
+        return
+
+    # Режим выгрузки мыслей
+    mode = context.user_data.get("mode")
+    if mode == "brain":
+        context.user_data.pop("mode", None)
+        profile = get_profile(uid)
+        system = build_system(profile)
+        try:
+            response = await call_claude(
+                [{"role": "user", "content": f"Пользователь выгружает всё из головы. Разбери по категориям: задачи, идеи, тревоги, цели. Для каждой категории дай короткий список. Текст:\n\n{text}"}],
+                system, model=MODEL_SMART)
+            clean = process_response(uid, response)
+            save_msg(uid, "user", f"[brain dump] {text[:100]}")
+            save_msg(uid, "assistant", clean)
+            await send_safe(update, clean, main_keyboard())
+        except:
+            await update.message.reply_text("Что-то пошло не так(", reply_markup=main_keyboard())
+        return
+    # Режим честного анализа
+    if mode == "ask":
+        context.user_data.pop("mode", None)
+        profile = get_profile(uid)
+        system = build_system(profile)
+        try:
+            response = await call_claude(
+                [{"role": "user", "content": f"Пользователь задаёт вопрос о себе и просит честный коучинговый ответ — как зеркало, без лишней мягкости, но с уважением. Вопрос: {text}"}],
+                system, model=MODEL_SMART)
+            clean = process_response(uid, response)
+            save_msg(uid, "user", f"[ask] {text}")
+            save_msg(uid, "assistant", clean)
+            await send_safe(update, clean, main_keyboard())
+        except:
+            await update.message.reply_text("Что-то пошло не так(", reply_markup=main_keyboard())
+        return
+    # Режим дневника — ответ на вопрос
+    if "journal_question" in context.user_data:
+        question = context.user_data.pop("journal_question")
+        save_journal(uid, question, text)
+        await send_safe(update, "Записала в дневник 📔", main_keyboard())
+        return
+    # Добавление привычки
+    if mode == "habit_add":
+        context.user_data.pop("mode", None)
+        get_or_create_habit(uid, text.strip())
+        await send_safe(update, f"Привычка «{text.strip()}» добавлена! Отмечай каждый день через /habits 💪", main_keyboard())
+        return
+    # Установка часового пояса через текст
+    if mode == "set_tz":
+        context.user_data.pop("mode", None)
+        profile = get_profile(uid)
+        system = build_system(profile)
+        try:
+            response = await call_claude(
+                [{"role": "user", "content": f"Пользователь написал своё текущее время: '{text}'. Вычисли UTC offset и ответь только строкой вида UTC+N или UTC-N."}],
+                system)
+            tz_str = response.strip().split()[0]
+            profile["timezone"] = tz_str
+            save_profile(uid, profile)
+            await send_safe(update, f"Часовой пояс обновлён: {tz_str}", main_keyboard())
+        except:
+            await update.message.reply_text("Не смог вычислить часовой пояс. Напиши в формате UTC+3", reply_markup=main_keyboard())
+        return
+
+    # Детектим когда пользователь говорит о победе/достижении
+    win_keywords = ("сделал", "завершил", "закончил", "выполнил", "достиг", "получил", "удалось", "победил", "справился")
+    if any(kw in text.lower() for kw in win_keywords) and len(text) < 200:
+        context.user_data["potential_win"] = text
+
     clear_followup(uid)
 
     history = get_history(uid)
@@ -1409,6 +1971,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(uid, "assistant", clean)
     if "?" in clean:
         set_followup(uid)
+
+    # Предлагаем отметить победу если Нова закрыла задачу
+    if "potential_win" in context.user_data and any(
+        kw in clean.lower() for kw in ("выполнен", "закрыт", "готово", "сделан", "✅")
+    ):
+        win_text = context.user_data.pop("potential_win")
+        add_win(uid, win_text)
+
     await send_safe(update, clean, main_keyboard() if onboarding_done else None)
 
 async def morning(context):
@@ -1623,20 +2193,34 @@ async def oauth_callback(request):
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("newuser", cmd_newuser))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("week", cmd_week))
-    app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("goals", cmd_goals))
-    app.add_handler(CommandHandler("ideas", cmd_ideas))
-    app.add_handler(CommandHandler("focus", cmd_focus))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("done",    cmd_done))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("today",   cmd_today))
+    app.add_handler(CommandHandler("week",    cmd_week))
+    app.add_handler(CommandHandler("month",   cmd_month))
+    app.add_handler(CommandHandler("goals",   cmd_goals))
+    app.add_handler(CommandHandler("ideas",   cmd_ideas))
+    app.add_handler(CommandHandler("focus",   cmd_focus))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
-    app.add_handler(CommandHandler("calendar", cmd_calendar))
-    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("sphere",  cmd_sphere))
+    app.add_handler(CommandHandler("reflect", cmd_reflect))
+    app.add_handler(CommandHandler("wins",    cmd_wins))
+    app.add_handler(CommandHandler("mood",    cmd_mood))
+    app.add_handler(CommandHandler("habits",  cmd_habits))
+    app.add_handler(CommandHandler("energy",  cmd_energy))
+    app.add_handler(CommandHandler("journal", cmd_journal))
+    app.add_handler(CommandHandler("brain",   cmd_brain))
+    app.add_handler(CommandHandler("ask",     cmd_ask))
+    app.add_handler(CommandHandler("review",  cmd_review))
+    app.add_handler(CommandHandler("calendar",cmd_calendar))
+    app.add_handler(CommandHandler("report",  cmd_report))
+    app.add_handler(CommandHandler("settings",cmd_settings))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("plan",    cmd_plan))
+    # Скрытые команды — не показываются в меню BotFather
+    app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("newuser", cmd_newuser))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -1648,7 +2232,37 @@ def main():
     jq.run_repeating(weekly_review, interval=3600, first=180)
     jq.run_repeating(check_followup, interval=1800, first=300)
 
+    from telegram import BotCommand
+
+    BOT_COMMANDS = [
+        BotCommand("start",    "Знакомство и онбординг"),
+        BotCommand("help",     "Что умею и как работать"),
+        BotCommand("today",    "Задачи на сегодня"),
+        BotCommand("week",     "План на неделю"),
+        BotCommand("month",    "План на месяц"),
+        BotCommand("goals",    "Цели и прогресс"),
+        BotCommand("ideas",    "Идеи и желания"),
+        BotCommand("focus",    "Главная задача прямо сейчас"),
+        BotCommand("checkin",  "Чекин состояния и энергии"),
+        BotCommand("sphere",   "Колесо жизни"),
+        BotCommand("reflect",  "Вопрос для самоанализа"),
+        BotCommand("wins",     "Победы и достижения"),
+        BotCommand("mood",     "Трекер настроения"),
+        BotCommand("habits",   "Трекер привычек"),
+        BotCommand("energy",   "Отметить уровень энергии"),
+        BotCommand("journal",  "Личный дневник"),
+        BotCommand("brain",    "Выгрузка мыслей"),
+        BotCommand("ask",      "Честный анализ от Новы"),
+        BotCommand("review",   "Ежемесячный разбор"),
+        BotCommand("calendar", "Google Календарь"),
+        BotCommand("report",   "Отчёт, графики, PDF"),
+        BotCommand("settings", "Настройки"),
+        BotCommand("profile",  "Мой профиль"),
+    ]
+
     async def start_web(app_obj):
+        await app_obj.bot.set_my_commands(BOT_COMMANDS)
+        logging.info("Bot commands registered")
         web_app = web.Application()
         web_app["bot"] = app_obj.bot
         web_app.router.add_get("/oauth/callback", oauth_callback)
