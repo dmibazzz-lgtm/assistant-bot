@@ -778,13 +778,18 @@ def get_calendar_service(uid):
     creds = get_google_token(uid)
     if not creds: return None
     try:
+        if creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            save_google_token(uid, creds)
         service = build("calendar", "v3", credentials=creds)
         return service
     except Exception as e:
         logging.error(f"Calendar service error: {e}")
         return None
 
-def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
+async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
+    import asyncio
     service = get_calendar_service(uid)
     if not service: return False
     try:
@@ -802,7 +807,9 @@ def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
             "start": {"date": start_date},
             "end": {"date": start_date},
         }
-        service.events().insert(calendarId="primary", body=event).execute()
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: service.events().insert(calendarId="primary", body=event).execute()
+        )
         logging.info(f"Calendar event added for user {uid}: {task_text}")
         return True
     except Exception as e:
@@ -1212,14 +1219,14 @@ async def call_groq_voice(audio_bytes):
     if r.status_code == 200: return r.json().get("text")
     return None
 
-def process_response(uid, text):
+async def process_response(uid, text):
     for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, match[0], match[1], match[2], match[3])
         log_sphere_activity(uid, match[2])
-        add_to_calendar(uid, match[0], timeframe=match[3])
+        await add_to_calendar(uid, match[0], timeframe=match[3])
     for t, p, s in re.findall(r'\[TASK:\s*([^|]+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, t, p, s)
-        add_to_calendar(uid, t)
+        await add_to_calendar(uid, t)
     for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_goal(uid, t, s, tf)
     for t, s in re.findall(r'\[GOAL:\s*([^|]+?)\s*\|\s*(\w+)\s*\]', text):
@@ -1276,7 +1283,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = await call_claude(
                 get_history(uid) + [{"role": "user", "content": "Начинаем! Старт этапа 1."}],
                 system, model=MODEL_SMART)
-            clean = process_response(uid, response)
+            clean = await process_response(uid, response)
             save_msg(uid, "user", "Начинаем!")
             save_msg(uid, "assistant", clean)
             await query.edit_message_text(clean, parse_mode="Markdown")
@@ -1427,7 +1434,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай краткий вывод — что знаешь обо мне и с чего начнём. Открой меню."}],
             system, model=MODEL_SMART)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         save_msg(uid, "assistant", clean)
         await send_safe(update, clean, main_keyboard())
     except:
@@ -1518,7 +1525,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             [{"role": "user", "content": f"Режим фокуса. Задачи:\n{task_list}\n\nОдна самая важная прямо сейчас — какая и почему?"}],
             system, model=MODEL_SMART)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         await send_safe(update, clean, main_keyboard())
     except:
         await update.message.reply_text("Что-то пошло не так)", reply_markup=main_keyboard())
@@ -1531,7 +1538,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             [{"role": "user", "content": "Проведи короткий чекин — спроси как я себя чувствую и какая энергия."}],
             system, model=MODEL_SMART)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         await send_safe(update, clean, main_keyboard())
     except:
         await update.message.reply_text("Как ты сейчас? 🙂", reply_markup=main_keyboard())
@@ -1740,7 +1747,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(uid, "user", f"[голосовое] {text}")
     try:
         response = await call_claude(history, system)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         save_msg(uid, "assistant", clean)
         if "?" in clean:
             set_followup(uid)
@@ -1764,7 +1771,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} Опиши что видишь, извлеки задачи, планы, важную информацию."
     try:
         response = await call_claude_vision(image_b64, system, prompt)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         save_msg(uid, "user", f"[фото] {caption}")
         save_msg(uid, "assistant", clean)
         await send_safe(update, clean, main_keyboard() if user[1] else None)
@@ -1797,7 +1804,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(uid, "user", f"[документ: {doc.file_name}]")
     try:
         response = await call_claude(history, system)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         save_msg(uid, "assistant", clean)
         await send_safe(update, clean, main_keyboard() if user[1] else None)
     except Exception as e:
@@ -1820,7 +1827,7 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(uid, "user", f"[пересланное] {text[:100]}")
     try:
         response = await call_claude(history, system)
-        clean = process_response(uid, response)
+        clean = await process_response(uid, response)
         save_msg(uid, "assistant", clean)
         await send_safe(update, clean, main_keyboard() if user[1] else None)
     except:
@@ -1897,7 +1904,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = await call_claude(
                 [{"role": "user", "content": f"Пользователь выгружает всё из головы. Разбери по категориям: задачи, идеи, тревоги, цели. Для каждой категории дай короткий список. Текст:\n\n{text}"}],
                 system, model=MODEL_SMART)
-            clean = process_response(uid, response)
+            clean = await process_response(uid, response)
             save_msg(uid, "user", f"[brain dump] {text[:100]}")
             save_msg(uid, "assistant", clean)
             await send_safe(update, clean, main_keyboard())
@@ -1913,7 +1920,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = await call_claude(
                 [{"role": "user", "content": f"Пользователь задаёт вопрос о себе и просит честный коучинговый ответ — как зеркало, без лишней мягкости, но с уважением. Вопрос: {text}"}],
                 system, model=MODEL_SMART)
-            clean = process_response(uid, response)
+            clean = await process_response(uid, response)
             save_msg(uid, "user", f"[ask] {text}")
             save_msg(uid, "assistant", clean)
             await send_safe(update, clean, main_keyboard())
@@ -1967,7 +1974,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error: {e}")
         await update.message.reply_text("Что-то пошло не так... попробуй ещё раз)"); return
 
-    clean = process_response(uid, response)
+    clean = await process_response(uid, response)
     save_msg(uid, "assistant", clean)
     if "?" in clean:
         set_followup(uid)
@@ -2145,7 +2152,7 @@ async def check_followup(context):
                     "Я не ответил на твой последний вопрос. Переформулируй его иначе — коротко, с другой стороны. "
                     "Не упоминай что я молчал."}],
                 system, model=MODEL_SMART)
-            clean = process_response(uid, response)
+            clean = await process_response(uid, response)
             await context.bot.send_message(uid, clean, parse_mode="Markdown")
             db_exec("UPDATE followup_queue SET asked_at=?, attempts=? WHERE user_id=?",
                     (datetime.now().isoformat(), attempts + 1, uid))
@@ -2176,9 +2183,12 @@ async def oauth_callback(request):
     if not code or not state:
         return web.Response(text="Ошибка авторизации — нет кода или state")
     try:
+        import asyncio
         uid = int(state)
         flow = get_oauth_flow()
-        flow.fetch_token(code=code)
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: flow.fetch_token(code=code)
+        )
         creds = flow.credentials
         save_google_token(uid, creds)
         await request.app["bot"].send_message(
