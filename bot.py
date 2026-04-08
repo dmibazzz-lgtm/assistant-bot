@@ -1,5 +1,5 @@
 import os, sys, httpx, sqlite3, json, logging, re, base64
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from google_auth_oauthlib.flow import Flow
@@ -159,10 +159,31 @@ def complete_task(task_id):
 def delete_task(task_id):
     db_exec("DELETE FROM tasks WHERE id=?", (task_id,))
 
-def edit_task(task_id, text=None, priority=None, timeframe=None):
+_UNSET = object()
+
+def edit_task(task_id, text=None, priority=None, timeframe=None, due_date=_UNSET):
     if text: db_exec("UPDATE tasks SET text=? WHERE id=?", (text, task_id))
     if priority: db_exec("UPDATE tasks SET priority=? WHERE id=?", (priority, task_id))
     if timeframe: db_exec("UPDATE tasks SET timeframe=? WHERE id=?", (timeframe, task_id))
+    if due_date is not _UNSET: db_exec("UPDATE tasks SET due_date=? WHERE id=?", (due_date, task_id))
+
+def update_goal_progress(goal_id, progress):
+    db_exec("UPDATE goals SET progress=? WHERE id=?", (progress, goal_id))
+
+def get_user_tz_offset(profile):
+    tz = profile.get("timezone", "")
+    if not tz:
+        return 0
+    m = re.search(r'([+-]?\d+)', tz)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    return 0
+
+def user_now(profile):
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=get_user_tz_offset(profile))
 
 def add_goal(uid, text, sphere="general", timeframe="longterm"):
     existing = db_fetch("SELECT id FROM goals WHERE user_id=? AND text=? AND done=0", (uid, text))
@@ -189,7 +210,6 @@ def get_ideas(uid, sphere=None):
     return db_fetch("SELECT id,text,sphere,created_at FROM ideas WHERE user_id=?", (uid,))
 
 def get_frozen_items(uid):
-    from datetime import timedelta
     week_ago = (datetime.now() - timedelta(days=7)).isoformat()[:10]
     ideas = db_fetch("SELECT id,text,sphere,'idea' FROM ideas WHERE user_id=? AND (reviewed_at IS NULL OR reviewed_at < ?)", (uid, week_ago))
     goals = db_fetch("SELECT id,text,sphere,'goal' FROM goals WHERE user_id=? AND done=0 AND progress=0 AND created_at < ?", (uid, week_ago))
@@ -235,7 +255,6 @@ def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
     service = get_calendar_service(uid)
     if not service: return False
     try:
-        from datetime import timedelta
         now = datetime.now()
         if due_date:
             start_date = due_date
@@ -343,6 +362,15 @@ def task_actions_keyboard(task_id):
          InlineKeyboardButton("⬅️ Назад", callback_data="tasks_all")]
     ])
 
+def move_timeframe_keyboard(task_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Сегодня", callback_data=f"tset_today_{task_id}"),
+         InlineKeyboardButton("📆 Завтра", callback_data=f"tset_tomorrow_{task_id}")],
+        [InlineKeyboardButton("🗓 На неделю", callback_data=f"tset_week_{task_id}"),
+         InlineKeyboardButton("🗓 На месяц", callback_data=f"tset_month_{task_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="tasks_all")]
+    ])
+
 def format_tasks(tasks, with_actions=False):
     if not tasks: return "Пусто 👌"
     icons = {"urgent": "🔴", "important": "🟡", "normal": "⚪"}
@@ -352,8 +380,16 @@ def format_tasks(tasks, with_actions=False):
         lines.append(f"{icon} [{t[0]}] {t[1]}")
     return "\n".join(lines)
 
+def format_goals(goals):
+    if not goals: return "Пусто 👌"
+    lines = []
+    for g in goals:
+        progress = g[4] if len(g) > 4 else 0
+        prog_str = f" — {progress}%" if progress else ""
+        lines.append(f"• [{g[0]}] {g[1]}{prog_str}")
+    return "\n".join(lines)
+
 def format_week_plan(uid):
-    from datetime import timedelta
     now = datetime.now()
     lines = [f"📅 *План на неделю*\n{now.strftime('%d.%m')} — {(now + timedelta(days=6)).strftime('%d.%m')}\n"]
     today = get_today_tasks(uid)
@@ -436,7 +472,7 @@ def build_system(profile, onboarding_mode=False):
     if profile.get("character"): p += f"Характер: {profile['character']}\n"
     if profile.get("notes"): p += f"Заметки: {profile['notes']}\n"
 
-    now = datetime.now()
+    now = user_now(profile)
     current_time = f"Сейчас: {now.strftime('%A, %d.%m.%Y, %H:%M')}"
 
     onboarding_block = ""
@@ -525,6 +561,9 @@ def build_system(profile, onboarding_mode=False):
 [DEL_TASK: id]
 [DONE_TASK: id]
 [EDIT_TASK: id | поле=значение]
+[GOAL_PROGRESS: id | процент]
+
+Если человек говорит о прогрессе по цели (сделал часть, продвинулся) → [GOAL_PROGRESS: id | 0-100]
 
 СФЕРЫ: {', '.join(SPHERES.values())}
 
@@ -548,7 +587,12 @@ async def call_claude(messages, system):
     async with httpx.AsyncClient() as client:
         r = await client.post("https://api.anthropic.com/v1/messages",
                               headers=headers, json=data, timeout=45)
-    return r.json()["content"][0]["text"]
+    result = r.json()
+    if "content" not in result:
+        err = result.get("error", {}).get("message", str(result))
+        logging.error(f"Claude API error: {err}")
+        raise Exception(f"Claude API error: {err}")
+    return result["content"][0]["text"]
 
 async def call_claude_vision(image_b64, system, prompt="Опиши что на фото и извлеки любые задачи, планы или важную информацию."):
     headers = {
@@ -597,8 +641,10 @@ def process_response(uid, text):
         add_to_calendar(uid, t)
     for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_goal(uid, t, s, tf)
-    for t, s in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\]', text):
+    for t, s in re.findall(r'\[GOAL:\s*([^|]+?)\s*\|\s*(\w+)\s*\]', text):
         add_goal(uid, t, s)
+    for gid, val in re.findall(r'\[GOAL_PROGRESS:\s*(\d+)\s*\|\s*(\d+)\s*\]', text):
+        update_goal_progress(int(gid), int(val))
     for t, s in re.findall(r'\[IDEA:\s*(.+?)\s*\|\s*(\w+)\s*\]', text):
         add_idea(uid, t, s)
     for tid in re.findall(r'\[DONE_TASK:\s*(\d+)\s*\]', text):
@@ -620,7 +666,7 @@ def process_response(uid, text):
                     k, _, v = pair.partition('=')
                     profile[k.strip()] = v.strip()
         save_profile(uid, profile)
-    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK):[^\]]+\]', '', text)
+    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS):[^\]]+\]', '', text)
     return text.strip()
 
 async def send_safe(update, text, reply_markup=None):
@@ -662,16 +708,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(f"📋 *Все задачи:*\n\n{format_tasks(tasks)}", tasks_keyboard()); return
     if data == "goals_short":
         goals = get_goals(uid, timeframe="short")
-        text = "*⚡ Краткосрочные:*\n\n" + ("\n".join([f"• [{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто 👌")
-        await edit(text, goals_keyboard()); return
+        await edit(f"*⚡ Краткосрочные:*\n\n{format_goals(goals)}", goals_keyboard()); return
     if data == "goals_long":
         goals = get_goals(uid, timeframe="longterm")
-        text = "*🏔 Долгосрочные:*\n\n" + ("\n".join([f"• [{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто 👌")
-        await edit(text, goals_keyboard()); return
+        await edit(f"*🏔 Долгосрочные:*\n\n{format_goals(goals)}", goals_keyboard()); return
     if data == "goals_all":
         goals = get_goals(uid)
-        text = "*🎯 Все цели:*\n\n" + ("\n".join([f"• [{g[0]}] {g[1]}" for g in goals]) if goals else "Пусто 👌")
-        await edit(text, goals_keyboard()); return
+        await edit(f"*🎯 Все цели:*\n\n{format_goals(goals)}", goals_keyboard()); return
     if data.startswith("tdone_"):
         complete_task(int(data.replace("tdone_", "")))
         await edit("✅ Задача выполнена!", tasks_keyboard()); return
@@ -680,7 +723,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit("🗑 Задача удалена.", tasks_keyboard()); return
     if data.startswith("tmove_"):
         tid = data.replace("tmove_", "")
-        await edit(f"Напиши мне: 'перенеси задачу {tid} на [когда]'"); return
+        await edit(f"Перенести задачу [{tid}] на:", move_timeframe_keyboard(tid)); return
+    if data.startswith("tset_"):
+        parts = data.split("_", 2)
+        tf, tid = parts[1], int(parts[2])
+        today = datetime.now().date().isoformat()
+        tomorrow = (datetime.now() + timedelta(days=1)).date().isoformat()
+        if tf == "today":
+            edit_task(tid, timeframe="today", due_date=today)
+        elif tf == "tomorrow":
+            edit_task(tid, timeframe="today", due_date=tomorrow)
+        elif tf == "week":
+            edit_task(tid, timeframe="week", due_date=None)
+        elif tf == "month":
+            edit_task(tid, timeframe="month", due_date=None)
+        await edit("✅ Задача перенесена!", tasks_keyboard()); return
     if data.startswith("sphere_"):
         sk = data.replace("sphere_", "")
         log_sphere_activity(uid, sk)
@@ -691,8 +748,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sph_goals_"):
         sk = data.replace("sph_goals_", "")
         goals = get_goals(uid, sphere=sk)
-        text = f"{SPHERES.get(sk)} — цели:\n\n" + ("\n".join([f"• {g[1]}" for g in goals]) if goals else "Пусто 👌")
-        await edit(text, sphere_detail_keyboard(sk)); return
+        await edit(f"{SPHERES.get(sk)} — цели:\n\n{format_goals(goals)}", sphere_detail_keyboard(sk)); return
     if data.startswith("sph_ideas_"):
         sk = data.replace("sph_ideas_", "")
         ideas = get_ideas(uid, sphere=sk)
@@ -789,8 +845,7 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     goals = get_goals(uid)
     if goals:
-        lines = ["*🎯 Твои цели:*\n"] + [f"• [{g[0]}] {g[1]}" for g in goals]
-        await send_safe(update, "\n".join(lines), main_keyboard())
+        await send_safe(update, f"*🎯 Твои цели:*\n\n{format_goals(goals)}", main_keyboard())
     else:
         await update.message.reply_text("Целей пока нет 🎯", reply_markup=main_keyboard())
 
@@ -996,14 +1051,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_safe(update, clean, main_keyboard() if onboarding_done else None)
 
 async def morning(context):
+    utc_now = datetime.now(timezone.utc)
     users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
     for uid, pj in users:
         profile = json.loads(pj)
+        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
+        if local_now.hour != 8:
+            continue
         name = profile.get("name", "")
         today_tasks = get_today_tasks(uid)
         urgent = get_tasks(uid, priority="urgent")
-        now = datetime.now()
-        msg = f"☀️ Доброе утро, {name}!\n{now.strftime('%d.%m.%Y')}\n\n"
+        msg = f"☀️ Доброе утро, {name}!\n{local_now.strftime('%d.%m.%Y')}\n\n"
         if today_tasks:
             msg += f"📅 На сегодня: {len(today_tasks)} задач\n"
             for t in today_tasks[:3]: msg += f"• {t[1]}\n"
@@ -1014,9 +1072,13 @@ async def morning(context):
         except: pass
 
 async def evening(context):
+    utc_now = datetime.now(timezone.utc)
     users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
     for uid, pj in users:
         profile = json.loads(pj)
+        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
+        if local_now.hour != 19:
+            continue
         name = profile.get("name", "")
         tasks = get_tasks(uid)
         stats = get_sphere_stats(uid)
@@ -1030,9 +1092,13 @@ async def evening(context):
         except: pass
 
 async def weekly_review(context):
+    utc_now = datetime.now(timezone.utc)
     users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
     for uid, pj in users:
         profile = json.loads(pj)
+        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
+        if local_now.hour != 10 or local_now.weekday() != 6:
+            continue
         name = profile.get("name", "")
         tasks = get_tasks(uid)
         goals = get_goals(uid)
@@ -1091,9 +1157,9 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     jq = app.job_queue
-    jq.run_daily(morning, dtime(5, 0))
-    jq.run_daily(evening, dtime(18, 0))
-    jq.run_daily(weekly_review, dtime(9, 0), days=(6,))
+    jq.run_repeating(morning, interval=3600, first=60)
+    jq.run_repeating(evening, interval=3600, first=120)
+    jq.run_repeating(weekly_review, interval=3600, first=180)
 
     async def start_web(app_obj):
         web_app = web.Application()
