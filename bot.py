@@ -189,7 +189,8 @@ def get_ideas(uid, sphere=None):
     return db_fetch("SELECT id,text,sphere,created_at FROM ideas WHERE user_id=?", (uid,))
 
 def get_frozen_items(uid):
-    week_ago = datetime.now().replace(day=datetime.now().day - 7).isoformat()[:10]
+    from datetime import timedelta
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()[:10]
     ideas = db_fetch("SELECT id,text,sphere,'idea' FROM ideas WHERE user_id=? AND (reviewed_at IS NULL OR reviewed_at < ?)", (uid, week_ago))
     goals = db_fetch("SELECT id,text,sphere,'goal' FROM goals WHERE user_id=? AND done=0 AND progress=0 AND created_at < ?", (uid, week_ago))
     return ideas[:3] + goals[:2]
@@ -591,7 +592,7 @@ def process_response(uid, text):
         add_task(uid, match[0], match[1], match[2], match[3])
         log_sphere_activity(uid, match[2])
         add_to_calendar(uid, match[0], timeframe=match[3])
-    for t, p, s in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
+    for t, p, s in re.findall(r'\[TASK:\s*([^|]+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, t, p, s)
         add_to_calendar(uid, t)
     for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
@@ -1056,12 +1057,7 @@ async def oauth_callback(request):
     try:
         uid = int(state)
         flow = get_oauth_flow()
-        flow.oauth2session.fetch_token(
-            token_url="https://oauth2.googleapis.com/token",
-            code=code,
-            client_secret=GOOGLE_CLIENT_SECRET,
-            include_client_id=True,
-        )
+        flow.fetch_token(code=code)
         creds = flow.credentials
         save_google_token(uid, creds)
         await request.app["bot"].send_message(
