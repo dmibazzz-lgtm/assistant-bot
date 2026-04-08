@@ -20,6 +20,27 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://assistant-bot-production-64
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+MODEL_FAST  = "claude-haiku-4-5-20251001"
+MODEL_SMART = "claude-sonnet-4-5-20251022"
+
+_SMART_KEYWORDS = {
+    "цель", "цели", "анализ", "отчёт", "отчет", "сферы", "сфера",
+    "конфликт", "психолог", "рефлекси", "онбординг", "еженедельн",
+    "прогресс", "мечта", "мечты", "стратег", "глубок", "проблема",
+    "тревог", "кризис", "смысл", "ценност", "мотивац",
+}
+
+def pick_model(messages):
+    last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    if not isinstance(last, str):
+        return MODEL_SMART
+    text = last.lower()
+    if len(last) > 100:
+        return MODEL_SMART
+    if any(kw in text for kw in _SMART_KEYWORDS):
+        return MODEL_SMART
+    return MODEL_FAST
+
 QUOTES = [
     ("Единственный человек, которым ты должен стараться быть лучше, — это ты вчера.", "Аноним"),
     ("Не бойся расти медленно. Бойся стоять на месте.", "Китайская мудрость"),
@@ -883,14 +904,16 @@ Timeframe: today / week / month / longterm
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
 
-async def call_claude(messages, system):
+async def call_claude(messages, system, model=None):
+    if model is None:
+        model = pick_model(messages)
     headers = {
         "x-api-key": CLAUDE_API_KEY.encode('ascii', 'ignore').decode('ascii'),
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
     }
     data = {
-        "model": "claude-sonnet-4-5",
+        "model": model,
         "max_tokens": 700,
         "system": system,
         "messages": messages
@@ -1005,7 +1028,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             response = await call_claude(
                 get_history(uid) + [{"role": "user", "content": "Начинаем! Старт этапа 1."}],
-                system)
+                system, model=MODEL_SMART)
             clean = process_response(uid, response)
             save_msg(uid, "user", "Начинаем!")
             save_msg(uid, "assistant", clean)
@@ -1103,7 +1126,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         response = await call_claude(
             get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай краткий вывод — что знаешь обо мне и с чего начнём. Открой меню."}],
-            system)
+            system, model=MODEL_SMART)
         clean = process_response(uid, response)
         save_msg(uid, "assistant", clean)
         await send_safe(update, clean, main_keyboard())
@@ -1194,7 +1217,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         response = await call_claude(
             [{"role": "user", "content": f"Режим фокуса. Задачи:\n{task_list}\n\nОдна самая важная прямо сейчас — какая и почему?"}],
-            system)
+            system, model=MODEL_SMART)
         clean = process_response(uid, response)
         await send_safe(update, clean, main_keyboard())
     except:
@@ -1207,7 +1230,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         response = await call_claude(
             [{"role": "user", "content": "Проведи короткий чекин — спроси как я себя чувствую и какая энергия."}],
-            system)
+            system, model=MODEL_SMART)
         clean = process_response(uid, response)
         await send_safe(update, clean, main_keyboard())
     except:
@@ -1376,7 +1399,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(uid, "user", text)
 
     try:
-        response = await call_claude(history, system)
+        model = MODEL_SMART if not onboarding_done else None
+        response = await call_claude(history, system, model=model)
     except Exception as e:
         logging.error(f"Error: {e}")
         await update.message.reply_text("Что-то пошло не так... попробуй ещё раз)"); return
@@ -1432,7 +1456,7 @@ async def morning(context):
 Стиль: живой, тёплый, не формальный. Не больше 10 строк суммарно."""
 
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system)
+            response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
             await context.bot.send_message(uid, response, parse_mode="Markdown")
             save_msg(uid, "assistant", response)
             set_followup(uid)
@@ -1475,7 +1499,7 @@ async def evening(context):
 Стиль: мягкий, заботливый, человечный. Не более 8 строк."""
 
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system)
+            response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
             await context.bot.send_message(uid, response, parse_mode="Markdown")
             save_msg(uid, "assistant", response)
             set_followup(uid)
@@ -1523,7 +1547,7 @@ async def weekly_review(context):
 Стиль: глубже обычного, аналитично но по-человечески. Не более 12 строк."""
 
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system)
+            response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
 
             # Отправляем график перед текстом
             chart = generate_sphere_chart(uid)
@@ -1550,7 +1574,7 @@ async def check_followup(context):
                 history + [{"role": "user", "content":
                     "Я не ответил на твой последний вопрос. Переформулируй его иначе — коротко, с другой стороны. "
                     "Не упоминай что я молчал."}],
-                system)
+                system, model=MODEL_SMART)
             clean = process_response(uid, response)
             await context.bot.send_message(uid, clean, parse_mode="Markdown")
             db_exec("UPDATE followup_queue SET asked_at=?, attempts=? WHERE user_id=?",
