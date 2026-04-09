@@ -180,7 +180,12 @@ def init_db():
         sphere TEXT DEFAULT 'general',
         timeframe TEXT DEFAULT 'week',
         done INTEGER DEFAULT 0,
-        due_date TEXT, created_at TEXT)""")
+        due_date TEXT, created_at TEXT,
+        done_at TEXT)""")
+    try:
+        c.execute("ALTER TABLE tasks ADD COLUMN done_at TEXT")
+    except Exception:
+        pass
     c.execute("""CREATE TABLE IF NOT EXISTS goals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, text TEXT,
@@ -325,7 +330,8 @@ def get_today_tasks(uid):
                  ORDER BY priority DESC""", (uid, today))
 
 def complete_task(task_id):
-    db_exec("UPDATE tasks SET done=1 WHERE id=?", (task_id,))
+    db_exec("UPDATE tasks SET done=1, done_at=? WHERE id=?",
+            (datetime.now().isoformat(), task_id))
 
 def delete_task(task_id):
     db_exec("DELETE FROM tasks WHERE id=?", (task_id,))
@@ -774,15 +780,19 @@ def get_google_token(uid):
         scopes=json.loads(row[6]))
     return creds
 
-def get_calendar_service(uid):
+async def get_calendar_service(uid):
+    import asyncio
     creds = get_google_token(uid)
     if not creds: return None
     try:
+        loop = asyncio.get_running_loop()
         if creds.expired and creds.refresh_token:
             from google.auth.transport.requests import Request
-            creds.refresh(Request())
+            await loop.run_in_executor(None, lambda: creds.refresh(Request()))
             save_google_token(uid, creds)
-        service = build("calendar", "v3", credentials=creds)
+        service = await loop.run_in_executor(
+            None, lambda: build("calendar", "v3", credentials=creds,
+                                cache_discovery=False))
         return service
     except Exception as e:
         logging.error(f"Calendar service error: {e}")
@@ -790,7 +800,7 @@ def get_calendar_service(uid):
 
 async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
     import asyncio
-    service = get_calendar_service(uid)
+    service = await get_calendar_service(uid)
     if not service: return False
     try:
         now = datetime.now()
@@ -1189,7 +1199,7 @@ async def call_claude_vision(image_b64, system, prompt="Опиши что на �
         "content-type": "application/json"
     }
     data = {
-        "model": "claude-sonnet-4-5",
+        "model": MODEL_SMART,
         "max_tokens": 700,
         "system": system,
         "messages": [{
@@ -1466,7 +1476,9 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    for t in ["users","messages","tasks","goals","ideas","sphere_activity","google_tokens"]:
+    for t in ["users","messages","tasks","goals","ideas","sphere_activity","google_tokens",
+              "mood_log","energy_log","habits","habit_log","journal","wins",
+              "sent_quotes","followup_queue"]:
         db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
     await update.message.reply_text("Сброс выполнен. Напиши /start")
 
@@ -1594,8 +1606,12 @@ async def cmd_sphere(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for pair in spheres_score.split(","):
             if ":" in pair:
                 k, v = pair.strip().split(":", 1)
-                bar = "█" * int(v.strip()) + "░" * (10 - int(v.strip()))
-                lines.append(f"{k.strip().capitalize()}: {bar} {v.strip()}/10")
+                try:
+                    val = max(0, min(10, int(v.strip())))
+                except ValueError:
+                    val = 5
+                bar = "█" * val + "░" * (10 - val)
+                lines.append(f"{k.strip().capitalize()}: {bar} {val}/10")
         chart = generate_wheel_chart(uid)
         if chart:
             await context.bot.send_photo(uid, photo=chart)
@@ -1980,11 +1996,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_followup(uid)
 
     # Предлагаем отметить победу если Нова закрыла задачу
-    if "potential_win" in context.user_data and any(
-        kw in clean.lower() for kw in ("выполнен", "закрыт", "готово", "сделан", "✅")
-    ):
-        win_text = context.user_data.pop("potential_win")
-        add_win(uid, win_text)
+    if "potential_win" in context.user_data:
+        if any(kw in clean.lower() for kw in ("выполнен", "закрыт", "готово", "сделан", "✅")):
+            win_text = context.user_data.pop("potential_win")
+            add_win(uid, win_text)
+        else:
+            context.user_data.pop("potential_win", None)
 
     await send_safe(update, clean, main_keyboard() if onboarding_done else None)
 
@@ -2050,8 +2067,9 @@ async def evening(context):
             continue
         address = profile.get("address") or profile.get("name") or ""
         tasks = get_tasks(uid)
+        today_str = (utc_now + timedelta(hours=get_user_tz_offset(profile))).date().isoformat()
         done_today = db_fetch("""SELECT text FROM tasks WHERE user_id=? AND done=1
-                                  AND created_at >= date('now', '-1 day')""", (uid,))
+                                  AND done_at >= ?""", (uid, today_str))
         stats = get_sphere_stats(uid)
         inactive = set(SPHERE_KEYS) - set(stats.keys())
 
