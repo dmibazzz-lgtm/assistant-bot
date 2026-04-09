@@ -1007,7 +1007,7 @@ ONBOARDING_INTRO = """Привет! Я Нова — твой личный асс
 
 Поехали — узнаем друг друга! 🚀"""
 
-def build_system(profile, onboarding_mode=False):
+def build_system(profile, onboarding_mode=False, uid=None):
     address = profile.get("address") or profile.get("name") or ""
     p_lines = []
     if address: p_lines.append(f"Обращение: {address}")
@@ -1165,6 +1165,9 @@ def build_system(profile, onboarding_mode=False):
 Timeframe: today / week / month / longterm
 СФЕРЫ: {', '.join(SPHERES.values())}
 
+GOOGLE CALENDAR:
+{f"✅ Подключён — каждый [TASK: ...] тег автоматически добавляет событие в Google Календарь пользователя. Когда пользователь просит добавить что-то в календарь — просто создай [TASK: ...] тег с нужной датой." if uid and get_google_token(uid) else "❌ Не подключён. Пользователь может подключить через /calendar. Не говори что у тебя нет интеграции с календарём — она есть, просто ещё не настроена."}
+
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
 
@@ -1287,8 +1290,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "onboarding_start":
         update_user(uid, onboarding_step=1)
+        # Деактивируем кнопку, оставляя приветственный текст нетронутым
+        disabled_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Начато", callback_data="noop")
+        ]])
+        try:
+            await query.edit_message_reply_markup(reply_markup=disabled_kb)
+        except Exception:
+            pass
         profile = get_profile(uid)
-        system = build_system(profile, onboarding_mode=True)
+        system = build_system(profile, onboarding_mode=True, uid=uid)
         try:
             response = await call_claude(
                 get_history(uid) + [{"role": "user", "content": "Начинаем! Старт этапа 1."}],
@@ -1296,10 +1307,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean = await process_response(uid, response)
             save_msg(uid, "user", "Начинаем!")
             save_msg(uid, "assistant", clean)
-            await query.edit_message_text(clean, parse_mode="Markdown")
+            await query.message.reply_text(clean, parse_mode="Markdown")
         except Exception as e:
             logging.error(f"Onboarding start error: {e}")
-            await query.edit_message_text("Отлично, начнём! Как тебя зовут и как к тебе обращаться?")
+            await query.message.reply_text("Отлично, начнём! Как тебя зовут и как к тебе обращаться?")
+        return
+    if data == "noop":
         return
     if data == "back_main":
         await edit("Главное меню 👇"); return
@@ -1439,7 +1452,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, onboarding_done=1)
     profile = get_profile(uid)
-    system = build_system(profile)
+    system = build_system(profile, uid=uid)
     try:
         response = await call_claude(
             get_history(uid) + [{"role": "user", "content": "Знакомство завершено. Сделай краткий вывод — что знаешь обо мне и с чего начнём. Открой меню."}],
@@ -1531,7 +1544,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     tasks = get_tasks(uid)
     profile = get_profile(uid)
-    system = build_system(profile)
+    system = build_system(profile, uid=uid)
     task_list = "\n".join([f"- ({t[2]}) {t[1]}" for t in tasks[:10]]) if tasks else "Задач нет"
     try:
         response = await call_claude(
@@ -1545,7 +1558,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     profile = get_profile(uid)
-    system = build_system(profile)
+    system = build_system(profile, uid=uid)
     try:
         response = await call_claude(
             [{"role": "user", "content": "Проведи короткий чекин — спроси как я себя чувствую и какая энергия."}],
@@ -1662,7 +1675,7 @@ async def cmd_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     profile = get_profile(uid)
-    system = build_system(profile)
+    system = build_system(profile, uid=uid)
     entries = get_journal_entries(uid, limit=3)
     context_block = ""
     if entries:
@@ -1704,7 +1717,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goals_block = "\n".join([f"• {g[1]} — {g[4]}%" for g in goals[:5]]) if goals else "нет"
     stats_block = ", ".join([f"{k}: {v}д" for k, v in list(stats.items())[:5]]) if stats else "нет данных"
 
-    system = build_system(profile)
+    system = build_system(profile, uid=uid)
     prompt = f"""Сделай ежемесячный разбор для пользователя.
 
 Открытых задач: {len(tasks)}
@@ -1757,7 +1770,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     profile = get_profile(uid)
     onboarding_done = user[1]
-    system = build_system(profile, onboarding_mode=not onboarding_done)
+    system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
     history = get_history(uid)
     history.append({"role": "user", "content": text})
     save_msg(uid, "user", f"[голосовое] {text}")
@@ -1783,7 +1796,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
     profile = get_profile(uid)
     user = get_user(uid)
-    system = build_system(profile, onboarding_mode=not user[1])
+    system = build_system(profile, onboarding_mode=not user[1], uid=uid)
     prompt = f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} Опиши что видишь, извлеки задачи, планы, важную информацию."
     try:
         response = await call_claude_vision(image_b64, system, prompt)
@@ -1814,7 +1827,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_content = text_content[:3000] + "...[обрезано]"
     profile = get_profile(uid)
     user = get_user(uid)
-    system = build_system(profile, onboarding_mode=not user[1])
+    system = build_system(profile, onboarding_mode=not user[1], uid=uid)
     history = get_history(uid)
     history.append({"role": "user", "content": f"Я прислала документ '{doc.file_name}':\n\n{text_content}\n\nПроанализируй, извлеки задачи и важную информацию."})
     save_msg(uid, "user", f"[документ: {doc.file_name}]")
@@ -1837,7 +1850,7 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     profile = get_profile(uid)
     user = get_user(uid)
-    system = build_system(profile, onboarding_mode=not user[1])
+    system = build_system(profile, onboarding_mode=not user[1], uid=uid)
     history = get_history(uid)
     history.append({"role": "user", "content": f"Я переслала сообщение:\n\n{text}\n\nОбработай — извлеки задачи, важную информацию или просто прокомментируй."})
     save_msg(uid, "user", f"[пересланное] {text[:100]}")
@@ -1887,7 +1900,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     profile = get_profile(uid)
     onboarding_done = user[1]
-    system = build_system(profile, onboarding_mode=not onboarding_done)
+    system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
 
     if onboarding_done:
         tasks = get_tasks(uid)
@@ -1915,7 +1928,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "brain":
         context.user_data.pop("mode", None)
         profile = get_profile(uid)
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         try:
             response = await call_claude(
                 [{"role": "user", "content": f"Пользователь выгружает всё из головы. Разбери по категориям: задачи, идеи, тревоги, цели. Для каждой категории дай короткий список. Текст:\n\n{text}"}],
@@ -1931,7 +1944,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "ask":
         context.user_data.pop("mode", None)
         profile = get_profile(uid)
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         try:
             response = await call_claude(
                 [{"role": "user", "content": f"Пользователь задаёт вопрос о себе и просит честный коучинговый ответ — как зеркало, без лишней мягкости, но с уважением. Вопрос: {text}"}],
@@ -1959,7 +1972,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "set_tz":
         context.user_data.pop("mode", None)
         profile = get_profile(uid)
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         try:
             response = await call_claude(
                 [{"role": "user", "content": f"Пользователь написал своё текущее время: '{text}'. Вычисли UTC offset и ответь только строкой вида UTC+N или UTC-N."}],
@@ -2030,7 +2043,7 @@ async def morning(context):
         if goals:
             goal_block = "Активных целей: " + str(len(goals))
 
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         prompt = f"""Сгенерируй утреннее уведомление для пользователя. Используй эти данные:
 
 Обращение: {address}
@@ -2073,7 +2086,7 @@ async def evening(context):
         stats = get_sphere_stats(uid)
         inactive = set(SPHERE_KEYS) - set(stats.keys())
 
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         inactive_labels = ", ".join([SPHERES[s] for s in list(inactive)[:3]]) if inactive else ""
         done_block = "\n".join([f"• {t[0]}" for t in done_today[:5]]) if done_today else "Нет данных"
 
@@ -2119,7 +2132,7 @@ async def weekly_review(context):
         stats_block = "\n".join([f"• {SPHERES.get(k,k)}: {v} дн." for k,v in stats.items()]) if stats else "Нет данных"
         frozen_block = "\n".join([f"• {f[1]}" for f in frozen[:3]]) if frozen else ""
 
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         prompt = f"""Сгенерируй еженедельный обзор для пользователя.
 
 Обращение: {address}
@@ -2163,7 +2176,7 @@ async def check_followup(context):
     for uid, asked_at, attempts in pending:
         profile = get_profile(uid)
         history = get_history(uid, limit=6)
-        system = build_system(profile)
+        system = build_system(profile, uid=uid)
         try:
             response = await call_claude(
                 history + [{"role": "user", "content":
