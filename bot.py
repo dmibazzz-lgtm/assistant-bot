@@ -21,7 +21,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://assistant-bot-production-64
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 MODEL_FAST  = "claude-haiku-4-5-20251001"
-MODEL_SMART = "claude-sonnet-4-5-20251022"
+MODEL_SMART = "claude-sonnet-4-6"
 
 _SMART_KEYWORDS = {
     "цель", "цели", "анализ", "отчёт", "отчет", "сферы", "сфера",
@@ -807,7 +807,7 @@ async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
             "start": {"date": start_date},
             "end": {"date": start_date},
         }
-        await asyncio.get_event_loop().run_in_executor(
+        await asyncio.get_running_loop().run_in_executor(
             None, lambda: service.events().insert(calendarId="primary", body=event).execute()
         )
         logging.info(f"Calendar event added for user {uid}: {task_text}")
@@ -2186,7 +2186,7 @@ async def oauth_callback(request):
         import asyncio
         uid = int(state)
         flow = get_oauth_flow()
-        await asyncio.get_event_loop().run_in_executor(
+        await asyncio.get_running_loop().run_in_executor(
             None, lambda: flow.fetch_token(code=code)
         )
         creds = flow.credentials
