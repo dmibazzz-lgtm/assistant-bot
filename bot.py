@@ -221,7 +221,12 @@ def init_db():
         token_uri TEXT,
         client_id TEXT,
         client_secret TEXT,
-        scopes TEXT)""")
+        scopes TEXT,
+        expiry TEXT)""")
+    try:
+        c.execute("ALTER TABLE google_tokens ADD COLUMN expiry TEXT")
+    except Exception:
+        pass
     c.execute("""CREATE TABLE IF NOT EXISTS sent_quotes (
         user_id INTEGER,
         quote_idx INTEGER,
@@ -777,19 +782,22 @@ def get_sphere_stats(uid):
     return {r[0]: r[1] for r in rows}
 
 def save_google_token(uid, creds):
+    expiry_str = creds.expiry.isoformat() if creds.expiry else None
     db_exec("""INSERT OR REPLACE INTO google_tokens
-               (user_id, token, refresh_token, token_uri, client_id, client_secret, scopes)
-               VALUES (?,?,?,?,?,?,?)""",
+               (user_id, token, refresh_token, token_uri, client_id, client_secret, scopes, expiry)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (uid, creds.token, creds.refresh_token, creds.token_uri,
-             creds.client_id, creds.client_secret, json.dumps(list(creds.scopes))))
+             creds.client_id, creds.client_secret, json.dumps(list(creds.scopes)), expiry_str))
 
 def get_google_token(uid):
-    row = db_fetchone("SELECT * FROM google_tokens WHERE user_id=?", (uid,))
+    row = db_fetchone("SELECT user_id,token,refresh_token,token_uri,client_id,client_secret,scopes,expiry FROM google_tokens WHERE user_id=?", (uid,))
     if not row: return None
+    from datetime import datetime as dt
+    expiry = dt.fromisoformat(row[7]) if row[7] else None
     creds = Credentials(
         token=row[1], refresh_token=row[2], token_uri=row[3],
         client_id=row[4], client_secret=row[5],
-        scopes=json.loads(row[6]))
+        scopes=json.loads(row[6]), expiry=expiry)
     return creds
 
 async def get_calendar_service(uid):
@@ -798,7 +806,8 @@ async def get_calendar_service(uid):
     if not creds: return None
     try:
         loop = asyncio.get_running_loop()
-        if creds.expired and creds.refresh_token:
+        # Обновляем токен если истёк или нет информации о сроке (на всякий случай)
+        if creds.refresh_token and (creds.expired or creds.expiry is None):
             from google.auth.transport.requests import Request
             await loop.run_in_executor(None, lambda: creds.refresh(Request()))
             save_google_token(uid, creds)
@@ -807,7 +816,7 @@ async def get_calendar_service(uid):
                                 cache_discovery=False))
         return service
     except Exception as e:
-        logging.error(f"Calendar service error: {e}")
+        logging.error(f"Calendar service error for uid={uid}: {e}")
         return None
 
 async def add_to_calendar(uid, task_text, due_date=None, timeframe=None, event_time=None):
