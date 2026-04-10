@@ -808,7 +808,9 @@ async def get_calendar_service(uid):
 async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
     import asyncio
     service = await get_calendar_service(uid)
-    if not service: return False
+    if not service:
+        logging.warning(f"Calendar service unavailable for user {uid}")
+        return None
     try:
         now = datetime.now()
         if due_date:
@@ -828,10 +830,14 @@ async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
             None, lambda: service.events().insert(calendarId="primary", body=event).execute()
         )
         logging.info(f"Calendar event added for user {uid}: {task_text}")
-        return True
+        # Форматируем дату для подтверждения
+        from datetime import date as date_type
+        d = date_type.fromisoformat(start_date)
+        months = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+        return f"{d.day} {months[d.month-1]}"
     except Exception as e:
-        logging.error(f"Calendar add error: {e}")
-        return False
+        logging.error(f"Calendar add error for user {uid}: {e}")
+        return None
 
 def get_oauth_flow():
     import os
@@ -1334,13 +1340,18 @@ async def call_groq_voice(audio_bytes):
     return None
 
 async def process_response(uid, text):
-    for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
+    cal_lines = []
+    for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, match[0], match[1], match[2], match[3])
         log_sphere_activity(uid, match[2])
-        await add_to_calendar(uid, match[0], timeframe=match[3])
-    for t, p, s in re.findall(r'\[TASK:\s*([^|]+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
+        date_str = await add_to_calendar(uid, match[0], timeframe=match[3])
+        if date_str:
+            cal_lines.append(f"📆 Добавила в календарь: _{match[0]}_ — {date_str}")
+    for t, p, s in re.findall(r'\[TASK:\s*([^|]+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\]', text):
         add_task(uid, t, p, s)
-        await add_to_calendar(uid, t)
+        date_str = await add_to_calendar(uid, t)
+        if date_str:
+            cal_lines.append(f"📆 Добавила в календарь: _{t}_ — {date_str}")
     for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
         add_goal(uid, t, s, tf)
     for t, s in re.findall(r'\[GOAL:\s*([^|]+?)\s*\|\s*(\w+)\s*\]', text):
@@ -1369,7 +1380,10 @@ async def process_response(uid, text):
                     profile[k.strip()] = v.strip()
         save_profile(uid, profile)
     text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS):[^\]]+\]', '', text)
-    return text.strip()
+    result = text.strip()
+    if cal_lines:
+        result = result + "\n\n" + "\n".join(cal_lines)
+    return result
 
 async def send_safe(update, text, reply_markup=None):
     try:
