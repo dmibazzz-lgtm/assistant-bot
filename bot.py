@@ -790,15 +790,30 @@ def save_google_token(uid, creds):
              creds.client_id, creds.client_secret, json.dumps(list(creds.scopes)), expiry_str))
 
 def get_google_token(uid):
-    row = db_fetchone("SELECT user_id,token,refresh_token,token_uri,client_id,client_secret,scopes,expiry FROM google_tokens WHERE user_id=?", (uid,))
-    if not row: return None
-    from datetime import datetime as dt
-    expiry = dt.fromisoformat(row[7]) if row[7] else None
-    creds = Credentials(
-        token=row[1], refresh_token=row[2], token_uri=row[3],
-        client_id=row[4], client_secret=row[5],
-        scopes=json.loads(row[6]), expiry=expiry)
-    return creds
+    try:
+        # Пробуем с колонкой expiry (новая схема)
+        row = db_fetchone("SELECT user_id,token,refresh_token,token_uri,client_id,client_secret,scopes,expiry FROM google_tokens WHERE user_id=?", (uid,))
+        if not row: return None
+        from datetime import datetime as dt
+        expiry = dt.fromisoformat(row[7]) if (len(row) > 7 and row[7]) else None
+        creds = Credentials(
+            token=row[1], refresh_token=row[2], token_uri=row[3],
+            client_id=row[4], client_secret=row[5],
+            scopes=json.loads(row[6]), expiry=expiry)
+        return creds
+    except Exception:
+        try:
+            # Fallback без expiry (старая схема)
+            row = db_fetchone("SELECT user_id,token,refresh_token,token_uri,client_id,client_secret,scopes FROM google_tokens WHERE user_id=?", (uid,))
+            if not row: return None
+            creds = Credentials(
+                token=row[1], refresh_token=row[2], token_uri=row[3],
+                client_id=row[4], client_secret=row[5],
+                scopes=json.loads(row[6]))
+            return creds
+        except Exception as e:
+            logging.error(f"get_google_token error uid={uid}: {e}")
+            return None
 
 async def get_calendar_service(uid):
     import asyncio
