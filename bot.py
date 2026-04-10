@@ -1875,20 +1875,28 @@ async def cmd_calreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_calinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    lines = ["🔍 *Диагностика Google Calendar:*\n"]
-    lines.append(f"• GOOGLE_CLIENT_ID: {'✅ есть' if GOOGLE_CLIENT_ID else '❌ НЕТ — нужно добавить в Railway'}")
-    lines.append(f"• GOOGLE_CLIENT_SECRET: {'✅ есть' if GOOGLE_CLIENT_SECRET else '❌ НЕТ — нужно добавить в Railway'}")
-    lines.append(f"• WEBHOOK_URL: `{WEBHOOK_URL}`")
-    token = get_google_token(uid)
-    lines.append(f"• Токен в базе: {'✅ есть' if token else '❌ нет — нужно /calendar'}")
-    if token:
-        service = await get_calendar_service(uid)
-        lines.append(f"• Токен рабочий: {'✅ да' if service else '❌ нет — нужно /calreset и /calendar'}")
-        if token.expired:
-            lines.append("• Статус токена: ⚠️ истёк (попытка обновить)")
-        else:
-            lines.append("• Статус токена: ✅ активен")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
+    try:
+        lines = ["Диагностика Google Calendar:\n"]
+        lines.append("GOOGLE_CLIENT_ID: " + ("есть" if GOOGLE_CLIENT_ID else "НЕТ - добавить в Railway Variables"))
+        lines.append("GOOGLE_CLIENT_SECRET: " + ("есть" if GOOGLE_CLIENT_SECRET else "НЕТ - добавить в Railway Variables"))
+        lines.append("WEBHOOK_URL: " + str(WEBHOOK_URL))
+        try:
+            token = get_google_token(uid)
+            lines.append("Токен в базе: " + ("есть" if token else "нет - нужно /calendar"))
+        except Exception as e:
+            lines.append("Токен в базе: ошибка - " + str(e)[:100])
+            token = None
+        if token:
+            try:
+                service = await get_calendar_service(uid)
+                lines.append("Токен рабочий: " + ("да" if service else "нет - нужно /calreset потом /calendar"))
+                expired = getattr(token, 'expired', False)
+                lines.append("Токен истёк: " + ("да" if expired else "нет"))
+            except Exception as e:
+                lines.append("Проверка токена: ошибка - " + str(e)[:100])
+        await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+    except Exception as e:
+        await update.message.reply_text("Ошибка диагностики: " + str(e)[:200])
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
