@@ -878,18 +878,18 @@ async def add_to_calendar(uid, task_text, due_date=None, timeframe=None, event_t
         logging.error(f"Calendar add error for user {uid}: {e}")
         return None
 
-async def list_calendar_events(uid, max_results=30):
-    """Возвращает список предстоящих событий [{id, summary, start}]"""
+async def list_calendar_events(uid, max_results=30, include_past=False):
+    """Возвращает список событий [{id, summary, start, calendar_id}]"""
     import asyncio
     service = await get_calendar_service(uid)
     if not service: return []
     try:
-        now = datetime.utcnow().isoformat() + "Z"
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: service.events().list(
-            calendarId="primary", timeMin=now,
-            maxResults=max_results, singleEvents=True, orderBy="startTime"
-        ).execute())
+        kwargs = dict(calendarId="primary", maxResults=max_results,
+                      singleEvents=True, orderBy="startTime")
+        if not include_past:
+            kwargs["timeMin"] = datetime.utcnow().isoformat() + "Z"
+        result = await loop.run_in_executor(None, lambda: service.events().list(**kwargs).execute())
         items = result.get("items", [])
         events = []
         for e in items:
@@ -949,9 +949,48 @@ async def update_calendar_event(uid, event_id, new_summary=None, new_date=None, 
         logging.error(f"Calendar update error uid={uid} event={event_id}: {e}")
         return False
 
+async def list_calendars(uid):
+    """Возвращает список всех календарей пользователя [{id, summary, primary}]"""
+    import asyncio
+    service = await get_calendar_service(uid)
+    if not service: return []
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: service.calendarList().list().execute())
+        cals = []
+        for c in result.get("items", []):
+            cals.append({
+                "id": c["id"],
+                "summary": c.get("summary", "(без названия)"),
+                "primary": c.get("primary", False),
+            })
+        return cals
+    except Exception as e:
+        logging.error(f"Calendar list error uid={uid}: {e}")
+        return []
+
+async def delete_extra_calendar(uid, calendar_id):
+    """Удаляет дополнительный календарь (не primary)"""
+    import asyncio
+    if calendar_id == "primary":
+        return False
+    service = await get_calendar_service(uid)
+    if not service: return False
+    try:
+        loop = asyncio.get_running_loop()
+        # Пробуем удалить, если нет прав — просто скрываем из списка
+        try:
+            await loop.run_in_executor(None, lambda: service.calendars().delete(calendarId=calendar_id).execute())
+        except Exception:
+            await loop.run_in_executor(None, lambda: service.calendarList().delete(calendarId=calendar_id).execute())
+        return True
+    except Exception as e:
+        logging.error(f"Calendar delete error uid={uid} cal={calendar_id}: {e}")
+        return False
+
 async def clear_all_calendar_events(uid):
-    """Удаляет все предстоящие события из основного календаря"""
-    events = await list_calendar_events(uid, max_results=250)
+    """Удаляет ВСЕ события (прошлые и будущие) из основного календаря"""
+    events = await list_calendar_events(uid, max_results=500, include_past=True)
     deleted = 0
     for e in events:
         ok = await delete_calendar_event(uid, e["id"])
@@ -1160,9 +1199,18 @@ def build_system(profile, onboarding_mode=False, uid=None, cal_events=None):
 
     # Блок с текущими событиями для управления календарём
     if cal_events:
-        ev_lines = ["Текущие события в календаре:"]
+        ev_lines = ["Текущие события в основном календаре:"]
+        cals_list = None
         for e in cal_events:
-            ev_lines.append("• id=" + e['id'] + " | " + e['summary'] + " | " + e['start'])
+            if "_calendars" in e:
+                cals_list = e["_calendars"]
+            else:
+                ev_lines.append("• id=" + e['id'] + " | " + e['summary'] + " | " + e['start'])
+        if cals_list:
+            ev_lines.append("\nДополнительные календари (папки):")
+            for c in cals_list:
+                marker = "(основной)" if c.get("primary") else ""
+                ev_lines.append("• id=" + c['id'] + " | " + c['summary'] + " " + marker)
         cal_events_block = "\n".join(ev_lines)
     else:
         cal_events_block = "(события не загружены)"
@@ -1172,15 +1220,17 @@ def build_system(profile, onboarding_mode=False, uid=None, cal_events=None):
         cal_block = (
             "✅ Подключён. Ты имеешь ПОЛНЫЙ доступ к Google Календарю пользователя.\n\n"
             "ДОБАВИТЬ событие → [TASK: название | приоритет | сфера | timeframe | HH:MM]\n"
-            "УДАЛИТЬ ВСЕ события → [CAL_DELETE_ALL]\n"
+            "УДАЛИТЬ ВСЕ события (прошлые и будущие) → [CAL_DELETE_ALL]\n"
             "УДАЛИТЬ одно событие → [CAL_DELETE: event_id]\n"
-            "ИЗМЕНИТЬ событие → [CAL_UPDATE: event_id | новое название | YYYY-MM-DD | HH:MM]\n\n"
+            "ИЗМЕНИТЬ событие → [CAL_UPDATE: event_id | новое название | YYYY-MM-DD | HH:MM]\n"
+            "УДАЛИТЬ дополнительный календарь → [CAL_DELETE_CALENDAR: calendar_id]\n\n"
             "Когда пользователь просит:\n"
             '- "добавь задачу/событие" → используй [TASK: ...]\n'
-            '- "удали всё / очисти календарь" → используй [CAL_DELETE_ALL]\n'
-            '- "удали событие X" → используй [CAL_DELETE: id]\n'
-            '- "перенеси / измени событие" → используй [CAL_UPDATE: id | ...]\n'
-            '- "покажи события" → ответь на основе списка ниже\n\n'
+            '- "удали всё / очисти" → [CAL_DELETE_ALL] — удалит ВСЕ события включая прошлые\n'
+            '- "удали событие X" → [CAL_DELETE: id]\n'
+            '- "удали папку/календарь X" → [CAL_DELETE_CALENDAR: id]\n'
+            '- "перенеси / измени событие" → [CAL_UPDATE: id | ...]\n'
+            '- "покажи что есть" → ответь на основе списков ниже\n\n'
             + cal_events_block
         )
     else:
@@ -1556,7 +1606,11 @@ async def process_response(uid, text):
     for event_id in re.findall(r'\[CAL_DELETE:\s*([^\]]+?)\s*\]', text):
         ok = await delete_calendar_event(uid, event_id.strip())
         if ok:
-            cal_lines.append(f"🗑 Событие удалено из календаря")
+            cal_lines.append("🗑 Событие удалено из календаря")
+    for cal_id in re.findall(r'\[CAL_DELETE_CALENDAR:\s*([^\]]+?)\s*\]', text):
+        ok = await delete_extra_calendar(uid, cal_id.strip())
+        if ok:
+            cal_lines.append("🗑 Календарь удалён")
     for match in re.findall(r'\[CAL_UPDATE:\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^\]]*?)\s*\]', text):
         event_id, new_title, new_date, new_time = match
         ok = await update_calendar_event(uid, event_id.strip(),
@@ -1566,7 +1620,7 @@ async def process_response(uid, text):
         if ok:
             cal_lines.append(f"✏️ Событие обновлено в календаре")
 
-    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS|CAL_DELETE_ALL|CAL_DELETE|CAL_UPDATE):[^\]]*\]', '', text)
+    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS|CAL_DELETE_ALL|CAL_DELETE|CAL_UPDATE|CAL_DELETE_CALENDAR):[^\]]*\]', '', text)
     text = re.sub(r'\[CAL_DELETE_ALL\]', '', text)
     result = text.strip()
     if cal_lines:
@@ -2240,12 +2294,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile = get_profile(uid)
     onboarding_done = user[1]
 
-    # Загружаем события если пользователь управляет Calendar
+    # Загружаем события и список календарей если пользователь управляет Calendar
     cal_events = None
     _cal_keywords = ("удали", "очисти", "убери", "перенеси", "измени", "измен", "редактир",
-                     "событи", "calendar", "календар", "покажи календар", "что в календар")
+                     "событи", "calendar", "календар", "папк", "группу", "список")
     if get_google_token(uid) and any(kw in text.lower() for kw in _cal_keywords):
-        cal_events = await list_calendar_events(uid, max_results=30)
+        cal_events = await list_calendar_events(uid, max_results=30, include_past=True)
+        cals = await list_calendars(uid)
+        # Добавим список доп. календарей к событиям чтобы AI знал их id
+        if cals:
+            cal_events = cal_events or []
+            cal_events.append({"_calendars": cals})
 
     system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid, cal_events=cal_events)
 
