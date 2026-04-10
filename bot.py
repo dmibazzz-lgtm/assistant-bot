@@ -2296,15 +2296,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Загружаем события и список календарей если пользователь управляет Calendar
     cal_events = None
-    _cal_keywords = ("удали", "очисти", "убери", "перенеси", "измени", "измен", "редактир",
-                     "событи", "calendar", "календар", "папк", "группу", "список")
+    _cal_keywords = ("удали", "очисти", "убери", "перенеси", "измени", "редактир",
+                     "событи", "календар", "папк", "группу", "список")
     if get_google_token(uid) and any(kw in text.lower() for kw in _cal_keywords):
-        cal_events = await list_calendar_events(uid, max_results=30, include_past=True)
-        cals = await list_calendars(uid)
-        # Добавим список доп. календарей к событиям чтобы AI знал их id
-        if cals:
-            cal_events = cal_events or []
-            cal_events.append({"_calendars": cals})
+        try:
+            cal_events = await list_calendar_events(uid, max_results=30, include_past=True)
+            cals = await list_calendars(uid)
+            if cals:
+                cal_events = cal_events or []
+                cal_events.append({"_calendars": cals})
+        except Exception as e:
+            logging.warning(f"Calendar context load error: {e}")
 
     system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid, cal_events=cal_events)
 
