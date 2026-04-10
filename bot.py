@@ -878,6 +878,87 @@ async def add_to_calendar(uid, task_text, due_date=None, timeframe=None, event_t
         logging.error(f"Calendar add error for user {uid}: {e}")
         return None
 
+async def list_calendar_events(uid, max_results=30):
+    """Возвращает список предстоящих событий [{id, summary, start}]"""
+    import asyncio
+    service = await get_calendar_service(uid)
+    if not service: return []
+    try:
+        now = datetime.utcnow().isoformat() + "Z"
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: service.events().list(
+            calendarId="primary", timeMin=now,
+            maxResults=max_results, singleEvents=True, orderBy="startTime"
+        ).execute())
+        items = result.get("items", [])
+        events = []
+        for e in items:
+            start = e.get("start", {})
+            events.append({
+                "id": e["id"],
+                "summary": e.get("summary", "(без названия)"),
+                "start": start.get("dateTime", start.get("date", "")),
+            })
+        return events
+    except Exception as e:
+        logging.error(f"Calendar list error uid={uid}: {e}")
+        return []
+
+async def delete_calendar_event(uid, event_id):
+    import asyncio
+    service = await get_calendar_service(uid)
+    if not service: return False
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: service.events().delete(
+            calendarId="primary", eventId=event_id).execute())
+        return True
+    except Exception as e:
+        logging.error(f"Calendar delete error uid={uid} event={event_id}: {e}")
+        return False
+
+async def update_calendar_event(uid, event_id, new_summary=None, new_date=None, new_time=None):
+    import asyncio, pytz
+    service = await get_calendar_service(uid)
+    if not service: return False
+    try:
+        loop = asyncio.get_running_loop()
+        event = await loop.run_in_executor(None, lambda: service.events().get(
+            calendarId="primary", eventId=event_id).execute())
+        if new_summary:
+            event["summary"] = new_summary
+        if new_date:
+            tz_str = get_profile(uid).get("timezone", "Europe/Moscow")
+            if new_time:
+                try:
+                    tz = pytz.timezone(tz_str)
+                except Exception:
+                    tz = pytz.timezone("Europe/Moscow")
+                h, m = (new_time.split(":") + ["00"])[:2]
+                start_dt = datetime.fromisoformat(new_date).replace(hour=int(h), minute=int(m))
+                end_dt = start_dt + timedelta(hours=1)
+                event["start"] = {"dateTime": tz.localize(start_dt).isoformat(), "timeZone": tz_str}
+                event["end"]   = {"dateTime": tz.localize(end_dt).isoformat(),   "timeZone": tz_str}
+            else:
+                event["start"] = {"date": new_date}
+                event["end"]   = {"date": new_date}
+        await loop.run_in_executor(None, lambda: service.events().update(
+            calendarId="primary", eventId=event_id, body=event).execute())
+        return True
+    except Exception as e:
+        logging.error(f"Calendar update error uid={uid} event={event_id}: {e}")
+        return False
+
+async def clear_all_calendar_events(uid):
+    """Удаляет все предстоящие события из основного календаря"""
+    events = await list_calendar_events(uid, max_results=250)
+    deleted = 0
+    for e in events:
+        ok = await delete_calendar_event(uid, e["id"])
+        if ok:
+            deleted += 1
+    return deleted
+
 def get_oauth_flow():
     import os
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
@@ -1059,7 +1140,7 @@ ONBOARDING_INTRO = """Привет! Я Нова — твой личный асс
 
 Поехали — узнаем друг друга! 🚀"""
 
-def build_system(profile, onboarding_mode=False, uid=None):
+def build_system(profile, onboarding_mode=False, uid=None, cal_events=None):
     address = profile.get("address") or profile.get("name") or ""
     p_lines = []
     if address: p_lines.append(f"Обращение: {address}")
@@ -1076,6 +1157,15 @@ def build_system(profile, onboarding_mode=False, uid=None):
 
     now = user_now(profile)
     current_time = f"Сейчас: {now.strftime('%A, %d.%m.%Y, %H:%M')}"
+
+    # Блок с текущими событиями для управления календарём
+    if cal_events:
+        lines = ["Текущие события в календаре:"]
+        for e in cal_events:
+            lines.append(f"• id={e['id']} | {e['summary']} | {e['start']}")
+        cal_events_block = "\n".join(lines)
+    else:
+        cal_events_block = "(события не загружены — загрузятся при запросе)"
 
     onboarding_block = ""
     if onboarding_mode:
@@ -1228,7 +1318,21 @@ Timeframe: today / tomorrow / week / month / longterm
 СФЕРЫ: {', '.join(SPHERES.values())}
 
 GOOGLE CALENDAR:
-{f"✅ Подключён — каждый [TASK: ...] тег автоматически добавляет событие в Google Календарь пользователя. Когда пользователь просит добавить что-то в календарь — просто создай [TASK: ...] тег с нужной датой." if uid and get_google_token(uid) else "❌ Не подключён. Пользователь может подключить через /calendar. Не говори что у тебя нет интеграции с календарём — она есть, просто ещё не настроена."}
+{f"""✅ Подключён. Ты имеешь ПОЛНЫЙ доступ к Google Календарю пользователя.
+
+ДОБАВИТЬ событие → [TASK: название | приоритет | сфера | timeframe | HH:MM]
+УДАЛИТЬ ВСЕ события → [CAL_DELETE_ALL]
+УДАЛИТЬ одно событие → [CAL_DELETE: event_id]
+ИЗМЕНИТЬ событие → [CAL_UPDATE: event_id | новое название | YYYY-MM-DD | HH:MM]
+
+Когда пользователь просит:
+- "добавь задачу/событие" → используй [TASK: ...]
+- "удали всё из календаря" / "очисти календарь" → используй [CAL_DELETE_ALL]
+- "удали событие X" → используй [CAL_DELETE: id] (id из списка событий ниже)
+- "перенеси / измени событие" → используй [CAL_UPDATE: id | ...]
+- "покажи события" → ответь на основе списка событий ниже
+
+{cal_events_block}""" if uid and get_google_token(uid) else "❌ Не подключён. Пользователь может подключить через /calendar. Не говори что у тебя нет интеграции с календарём — она есть, просто ещё не настроена."}
 
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
@@ -1437,7 +1541,28 @@ async def process_response(uid, text):
                     k, _, v = pair.partition('=')
                     profile[k.strip()] = v.strip()
         save_profile(uid, profile)
-    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS):[^\]]+\]', '', text)
+    # Управление событиями Google Calendar
+    if re.search(r'\[CAL_DELETE_ALL\]', text):
+        deleted = await clear_all_calendar_events(uid)
+        if deleted > 0:
+            cal_lines.append(f"🗑 Удалила {deleted} событий из календаря")
+        else:
+            cal_lines.append("🗑 События не найдены или Calendar не подключён")
+    for event_id in re.findall(r'\[CAL_DELETE:\s*([^\]]+?)\s*\]', text):
+        ok = await delete_calendar_event(uid, event_id.strip())
+        if ok:
+            cal_lines.append(f"🗑 Событие удалено из календаря")
+    for match in re.findall(r'\[CAL_UPDATE:\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^\]]*?)\s*\]', text):
+        event_id, new_title, new_date, new_time = match
+        ok = await update_calendar_event(uid, event_id.strip(),
+            new_summary=new_title.strip() or None,
+            new_date=new_date.strip() or None,
+            new_time=new_time.strip() or None)
+        if ok:
+            cal_lines.append(f"✏️ Событие обновлено в календаре")
+
+    text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS|CAL_DELETE_ALL|CAL_DELETE|CAL_UPDATE):[^\]]*\]', '', text)
+    text = re.sub(r'\[CAL_DELETE_ALL\]', '', text)
     result = text.strip()
     if cal_lines:
         result = result + "\n\n" + "\n".join(cal_lines)
@@ -2104,7 +2229,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     profile = get_profile(uid)
     onboarding_done = user[1]
-    system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
+
+    # Загружаем события если пользователь управляет Calendar
+    cal_events = None
+    _cal_keywords = ("удали", "очисти", "убери", "перенеси", "измени", "измен", "редактир",
+                     "событи", "calendar", "календар", "покажи календар", "что в календар")
+    if get_google_token(uid) and any(kw in text.lower() for kw in _cal_keywords):
+        cal_events = await list_calendar_events(uid, max_results=30)
+
+    system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid, cal_events=cal_events)
 
     if onboarding_done:
         tasks = get_tasks(uid)
