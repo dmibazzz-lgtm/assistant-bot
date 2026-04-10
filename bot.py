@@ -2287,10 +2287,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = get_user(uid)
+    if not user:
+        await update.message.reply_text("Привет! Напиши /start чтобы начать.")
+        return
     if await handle_menu_button(update, context):
         return
 
     text = update.message.text
+    if not text:
+        return
+
     profile = get_profile(uid)
     onboarding_done = user[1]
 
