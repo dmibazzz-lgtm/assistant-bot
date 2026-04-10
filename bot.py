@@ -33,6 +33,11 @@ _SMART_KEYWORDS = {
     "конфликт", "психолог", "рефлекси", "онбординг", "еженедельн",
     "прогресс", "мечта", "мечты", "стратег", "глубок", "проблема",
     "тревог", "кризис", "смысл", "ценност", "мотивац",
+    # Задачи и планирование — только Claude генерирует теги надёжно
+    "задач", "запиш", "добавь", "добавить", "напомни", "запланир",
+    "сделать", "сделай", "внеси", "поставь", "зафиксир", "отметь",
+    "календар", "перенеси", "удали", "выполни", "завтра", "сегодня",
+    "неделя", "неделе", "месяц", "дедлайн", "срок", "план",
 }
 
 def pick_model(messages):
@@ -41,7 +46,7 @@ def pick_model(messages):
     if not isinstance(last, str):
         return MODEL_SMART, "claude"
     text = last.lower()
-    if len(last) > 100 or any(kw in text for kw in _SMART_KEYWORDS):
+    if len(last) > 50 or any(kw in text for kw in _SMART_KEYWORDS):
         return MODEL_SMART, "claude"
     # Дешёвые запросы — DeepSeek через OpenRouter если ключ есть
     if OPENROUTER_API_KEY:
