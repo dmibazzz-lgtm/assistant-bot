@@ -1159,6 +1159,13 @@ def build_system(profile, onboarding_mode=False, uid=None):
 - Человек рассуждает → спроси: "Добавить как задачу?"
 - "хотелось бы", "мечтаю", "было бы здорово" → всегда фиксируй как идею без вопроса
 
+УМНОЕ ПЛАНИРОВАНИЕ (обязательно):
+- Если время задачи размыто ("на неделе", "как-нибудь", "скоро", "надо бы") — ВСЕГДА уточни конкретный день или предложи сам: "Поставить на вторник в 11:00?"
+- Если у человека уже есть задачи — учти загруженность. Не ставь 5 срочных дел на один день.
+- Для звонков, встреч, административных дел — предлагай конкретное время: утро (9-11), день (13-15), вечер (18-20).
+- Если человек говорит "позвони", "запишись", "сходи" — это задача с временем. Спроси: "Когда удобнее — утром или днём?"
+- После добавления задачи — кратко подтверди: что зафиксировала и когда.
+
 РЕДАКТИРОВАНИЕ:
 "удали задачу 5" → [DEL_TASK: 5]
 "выполни задачу 3" → [DONE_TASK: 3]
@@ -1587,10 +1594,19 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     existing = get_google_token(uid)
     if existing:
-        await update.message.reply_text(
-            "✅ Google Календарь уже подключён!\n\nВсе новые задачи автоматически попадают в календарь.",
-            reply_markup=main_keyboard())
-        return
+        # Проверяем что токен реально работает
+        service = await get_calendar_service(uid)
+        if service:
+            await update.message.reply_text(
+                "✅ Google Календарь подключён и работает!\n\nВсе новые задачи автоматически попадают в календарь.\n\nЧтобы переподключить — напиши /calreset",
+                reply_markup=main_keyboard())
+            return
+        else:
+            # Токен есть но сломан — удаляем и переподключаем
+            db_exec("DELETE FROM google_tokens WHERE user_id=?", (uid,))
+            await update.message.reply_text(
+                "⚠️ Токен Calendar устарел, нужно переподключить.\nСейчас отправлю новую ссылку...",
+                reply_markup=main_keyboard())
     try:
         flow = get_oauth_flow()
         auth_url, _ = flow.authorization_url(
@@ -1606,6 +1622,11 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Calendar auth error: {e}")
         await update.message.reply_text("Что-то пошло не так при подключении календаря(", reply_markup=main_keyboard())
+
+async def cmd_calreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    db_exec("DELETE FROM google_tokens WHERE user_id=?", (uid,))
+    await update.message.reply_text("🔄 Отключила Calendar. Напиши /calendar чтобы подключить заново.", reply_markup=main_keyboard())
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2385,6 +2406,7 @@ def main():
     app.add_handler(CommandHandler("ask",     cmd_ask))
     app.add_handler(CommandHandler("review",  cmd_review))
     app.add_handler(CommandHandler("calendar",cmd_calendar))
+    app.add_handler(CommandHandler("calreset",cmd_calreset))
     app.add_handler(CommandHandler("report",  cmd_report))
     app.add_handler(CommandHandler("settings",cmd_settings))
     app.add_handler(CommandHandler("profile", cmd_profile))
