@@ -810,7 +810,7 @@ async def get_calendar_service(uid):
         logging.error(f"Calendar service error: {e}")
         return None
 
-async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
+async def add_to_calendar(uid, task_text, due_date=None, timeframe=None, event_time=None):
     import asyncio
     service = await get_calendar_service(uid)
     if not service:
@@ -822,24 +822,49 @@ async def add_to_calendar(uid, task_text, due_date=None, timeframe=None):
             start_date = due_date
         elif timeframe == "today":
             start_date = now.date().isoformat()
+        elif timeframe == "tomorrow":
+            start_date = (now + timedelta(days=1)).date().isoformat()
         elif timeframe == "week":
             start_date = (now + timedelta(days=3)).date().isoformat()
+        elif timeframe == "month":
+            start_date = (now + timedelta(days=14)).date().isoformat()
         else:
             start_date = (now + timedelta(days=7)).date().isoformat()
-        event = {
-            "summary": task_text,
-            "start": {"date": start_date},
-            "end": {"date": start_date},
-        }
+
+        months = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+        from datetime import date as date_type
+        d = date_type.fromisoformat(start_date)
+        date_label = f"{d.day} {months[d.month-1]}"
+
+        if event_time:
+            # Событие с конкретным временем
+            import pytz
+            tz_str = get_profile(uid).get("timezone", "Europe/Moscow")
+            try:
+                tz = pytz.timezone(tz_str)
+            except Exception:
+                tz = pytz.timezone("Europe/Moscow")
+            h, m = (event_time.split(":") + ["00"])[:2]
+            start_dt = datetime.fromisoformat(start_date).replace(hour=int(h), minute=int(m))
+            end_dt = start_dt + timedelta(hours=1)
+            event = {
+                "summary": task_text,
+                "start": {"dateTime": tz.localize(start_dt).isoformat(), "timeZone": tz_str},
+                "end":   {"dateTime": tz.localize(end_dt).isoformat(),   "timeZone": tz_str},
+            }
+            date_label = f"{d.day} {months[d.month-1]} в {h}:{m.zfill(2)}"
+        else:
+            event = {
+                "summary": task_text,
+                "start": {"date": start_date},
+                "end":   {"date": start_date},
+            }
+
         await asyncio.get_running_loop().run_in_executor(
             None, lambda: service.events().insert(calendarId="primary", body=event).execute()
         )
-        logging.info(f"Calendar event added for user {uid}: {task_text}")
-        # Форматируем дату для подтверждения
-        from datetime import date as date_type
-        d = date_type.fromisoformat(start_date)
-        months = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-        return f"{d.day} {months[d.month-1]}"
+        logging.info(f"Calendar event added for user {uid}: {task_text} @ {start_date}")
+        return date_label
     except Exception as e:
         logging.error(f"Calendar add error for user {uid}: {e}")
         return None
@@ -1187,7 +1212,10 @@ def build_system(profile, onboarding_mode=False, uid=None):
 [GOAL_PROGRESS: id | процент]
 
 Приоритеты задач: urgent / important / normal
-Timeframe: today / week / month / longterm
+Timeframe: today / tomorrow / week / month / longterm
+Время (5-е поле, опционально): формат HH:MM — указывай если пользователь назвал время или ты предлагаешь конкретный слот.
+Пример с временем: [TASK: позвонить в ЖКХ | important | general | tomorrow | 11:00]
+Пример без времени: [TASK: купить продукты | normal | general | today]
 СФЕРЫ: {', '.join(SPHERES.values())}
 
 GOOGLE CALENDAR:
@@ -1353,12 +1381,21 @@ async def call_groq_voice(audio_bytes):
 
 async def process_response(uid, text):
     cal_lines = []
+    # 5 полей: текст | приоритет | сфера | timeframe | HH:MM (время опционально)
+    for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\|\s*(\w+)\s*\|\s*(\d{1,2}:\d{2})\s*\]', text):
+        add_task(uid, match[0], match[1], match[2], match[3])
+        log_sphere_activity(uid, match[2])
+        date_str = await add_to_calendar(uid, match[0], timeframe=match[3], event_time=match[4])
+        if date_str:
+            cal_lines.append(f"📆 Добавила в календарь: _{match[0]}_ — {date_str}")
+    # 4 поля: текст | приоритет | сфера | timeframe
     for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\|\s*(\w+)\s*\]', text):
         add_task(uid, match[0], match[1], match[2], match[3])
         log_sphere_activity(uid, match[2])
         date_str = await add_to_calendar(uid, match[0], timeframe=match[3])
         if date_str:
             cal_lines.append(f"📆 Добавила в календарь: _{match[0]}_ — {date_str}")
+    # 3 поля (без timeframe)
     for t, p, s in re.findall(r'\[TASK:\s*([^|]+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\]', text):
         add_task(uid, t, p, s)
         date_str = await add_to_calendar(uid, t)
@@ -1627,6 +1664,23 @@ async def cmd_calreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     db_exec("DELETE FROM google_tokens WHERE user_id=?", (uid,))
     await update.message.reply_text("🔄 Отключила Calendar. Напиши /calendar чтобы подключить заново.", reply_markup=main_keyboard())
+
+async def cmd_calinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    lines = ["🔍 *Диагностика Google Calendar:*\n"]
+    lines.append(f"• GOOGLE_CLIENT_ID: {'✅ есть' if GOOGLE_CLIENT_ID else '❌ НЕТ — нужно добавить в Railway'}")
+    lines.append(f"• GOOGLE_CLIENT_SECRET: {'✅ есть' if GOOGLE_CLIENT_SECRET else '❌ НЕТ — нужно добавить в Railway'}")
+    lines.append(f"• WEBHOOK_URL: `{WEBHOOK_URL}`")
+    token = get_google_token(uid)
+    lines.append(f"• Токен в базе: {'✅ есть' if token else '❌ нет — нужно /calendar'}")
+    if token:
+        service = await get_calendar_service(uid)
+        lines.append(f"• Токен рабочий: {'✅ да' if service else '❌ нет — нужно /calreset и /calendar'}")
+        if token.expired:
+            lines.append("• Статус токена: ⚠️ истёк (попытка обновить)")
+        else:
+            lines.append("• Статус токена: ✅ активен")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2367,6 +2421,10 @@ async def oauth_callback(request):
     try:
         import asyncio
         uid = int(state)
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            await request.app["bot"].send_message(uid,
+                "❌ Calendar не настроен: отсутствуют GOOGLE_CLIENT_ID или GOOGLE_CLIENT_SECRET в переменных Railway.\n\nНужно добавить их в Railway → Variables.")
+            return web.Response(text="Ошибка: Google credentials не настроены на сервере.")
         flow = get_oauth_flow()
         await asyncio.get_running_loop().run_in_executor(
             None, lambda: flow.fetch_token(code=code)
@@ -2380,7 +2438,13 @@ async def oauth_callback(request):
         return web.Response(text="✅ Готово! Можешь закрыть эту вкладку и вернуться в Telegram.")
     except Exception as e:
         logging.error(f"OAuth callback error: {e}")
-        return web.Response(text=f"Что-то пошло не так: {e}")
+        try:
+            uid = int(state)
+            await request.app["bot"].send_message(uid,
+                f"❌ Ошибка подключения Calendar:\n`{str(e)[:300]}`\n\nОтправь этот текст разработчику.")
+        except Exception:
+            pass
+        return web.Response(text=f"Ошибка: {e}")
 
 def main():
     init_db()
@@ -2407,6 +2471,7 @@ def main():
     app.add_handler(CommandHandler("review",  cmd_review))
     app.add_handler(CommandHandler("calendar",cmd_calendar))
     app.add_handler(CommandHandler("calreset",cmd_calreset))
+    app.add_handler(CommandHandler("calinfo",cmd_calinfo))
     app.add_handler(CommandHandler("report",  cmd_report))
     app.add_handler(CommandHandler("settings",cmd_settings))
     app.add_handler(CommandHandler("profile", cmd_profile))

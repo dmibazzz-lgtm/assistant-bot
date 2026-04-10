@@ -5,3 +5,4 @@ libsql-experimental
 google-auth-oauthlib==0.8.0
 google-api-python-client
 aiohttp
+pytz
