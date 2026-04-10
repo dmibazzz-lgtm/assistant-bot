@@ -162,12 +162,13 @@ QUOTES = [
     ("Самопознание — начало всякой мудрости.", "Аристотель"),
 ]
 
-def get_conn():
+def get_conn(sync=True):
     if TURSO_URL and TURSO_TOKEN:
         try:
             import libsql_experimental as libsql
             conn = libsql.connect("nova.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
-            conn.sync()
+            if sync:
+                conn.sync()
             return conn
         except Exception as e:
             logging.warning(f"Turso failed: {e}")
@@ -281,7 +282,7 @@ def db_exec(query, params=()):
     conn.close()
 
 def db_fetch(query, params=()):
-    conn = get_conn()
+    conn = get_conn(sync=False)
     c = conn.cursor()
     c.execute(query, tuple(params))
     rows = c.fetchall()
@@ -289,7 +290,7 @@ def db_fetch(query, params=()):
     return rows
 
 def db_fetchone(query, params=()):
-    conn = get_conn()
+    conn = get_conn(sync=False)
     c = conn.cursor()
     c.execute(query, tuple(params))
     row = c.fetchone()
@@ -1567,24 +1568,26 @@ async def call_groq_voice(audio_bytes):
 
 async def process_response(uid, text):
     cal_lines = []
-    # 5 полей: текст | приоритет | сфера | timeframe | HH:MM (время опционально)
-    for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\|\s*(\w+)\s*\|\s*(\d{1,2}:\d{2})\s*\]', text):
-        add_task(uid, match[0], match[1], match[2], match[3])
-        log_sphere_activity(uid, match[2])
-        date_str = await add_to_calendar(uid, match[0], timeframe=match[3], event_time=match[4])
-        if date_str:
-            cal_lines.append(f"📆 Добавила в календарь: _{match[0]}_ — {date_str}")
-    # 4 поля: текст | приоритет | сфера | timeframe
-    for match in re.findall(r'\[TASK:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\|\s*(\w+)\s*\]', text):
-        add_task(uid, match[0], match[1], match[2], match[3])
-        log_sphere_activity(uid, match[2])
-        date_str = await add_to_calendar(uid, match[0], timeframe=match[3])
-        if date_str:
-            cal_lines.append(f"📆 Добавила в календарь: _{match[0]}_ — {date_str}")
-    # 3 поля (без timeframe)
-    for t, p, s in re.findall(r'\[TASK:\s*([^|]+?)\s*\|\s*(\w+)\s*\|\s*([\w\W]+?)\s*\]', text):
-        add_task(uid, t, p, s)
-        date_str = await add_to_calendar(uid, t)
+    # Парсим все [TASK:...] теги ровно один раз — без дублирования
+    for m in re.finditer(r'\[TASK:([^\]]+)\]', text):
+        parts = [p.strip() for p in m.group(1).split('|')]
+        date_str = None
+        if len(parts) >= 5 and re.match(r'^\d{1,2}:\d{2}$', parts[4]):
+            t, p, s, tf, et = parts[0], parts[1], parts[2], parts[3], parts[4]
+            add_task(uid, t, p, s, tf)
+            log_sphere_activity(uid, s)
+            date_str = await add_to_calendar(uid, t, timeframe=tf, event_time=et)
+        elif len(parts) >= 4:
+            t, p, s, tf = parts[0], parts[1], parts[2], parts[3]
+            add_task(uid, t, p, s, tf)
+            log_sphere_activity(uid, s)
+            date_str = await add_to_calendar(uid, t, timeframe=tf)
+        elif len(parts) >= 3:
+            t, p, s = parts[0], parts[1], parts[2]
+            add_task(uid, t, p, s)
+            date_str = await add_to_calendar(uid, t)
+        else:
+            continue
         if date_str:
             cal_lines.append(f"📆 Добавила в календарь: _{t}_ — {date_str}")
     for t, s, tf in re.findall(r'\[GOAL:\s*(.+?)\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\]', text):
@@ -1639,7 +1642,7 @@ async def process_response(uid, text):
             cal_lines.append(f"✏️ Событие обновлено в календаре")
 
     text = re.sub(r'\[(TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS|CAL_DELETE_ALL|CAL_DELETE|CAL_UPDATE|CAL_DELETE_CALENDAR):[^\]]*\]', '', text)
-    text = re.sub(r'\[CAL_DELETE_ALL\]', '', text)
+    text = re.sub(r'\[CAL_DELETE_ALL\]', '', text)  # fallback если нет двоеточия
     result = text.strip()
     if cal_lines:
         result = result + "\n\n" + "\n".join(cal_lines)
@@ -2761,6 +2764,7 @@ def main():
         BotCommand("report",   "Отчёт, графики, PDF"),
         BotCommand("settings", "Настройки"),
         BotCommand("profile",  "Мой профиль"),
+        BotCommand("plan",     "Недельный план — задачи + приоритеты"),
     ]
 
     async def start_web(app_obj):
