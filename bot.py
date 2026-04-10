@@ -1160,12 +1160,31 @@ def build_system(profile, onboarding_mode=False, uid=None, cal_events=None):
 
     # Блок с текущими событиями для управления календарём
     if cal_events:
-        lines = ["Текущие события в календаре:"]
+        ev_lines = ["Текущие события в календаре:"]
         for e in cal_events:
-            lines.append(f"• id={e['id']} | {e['summary']} | {e['start']}")
-        cal_events_block = "\n".join(lines)
+            ev_lines.append("• id=" + e['id'] + " | " + e['summary'] + " | " + e['start'])
+        cal_events_block = "\n".join(ev_lines)
     else:
-        cal_events_block = "(события не загружены — загрузятся при запросе)"
+        cal_events_block = "(события не загружены)"
+
+    # Блок Calendar для системного промпта (без вложенных f-строк)
+    if uid and get_google_token(uid):
+        cal_block = (
+            "✅ Подключён. Ты имеешь ПОЛНЫЙ доступ к Google Календарю пользователя.\n\n"
+            "ДОБАВИТЬ событие → [TASK: название | приоритет | сфера | timeframe | HH:MM]\n"
+            "УДАЛИТЬ ВСЕ события → [CAL_DELETE_ALL]\n"
+            "УДАЛИТЬ одно событие → [CAL_DELETE: event_id]\n"
+            "ИЗМЕНИТЬ событие → [CAL_UPDATE: event_id | новое название | YYYY-MM-DD | HH:MM]\n\n"
+            "Когда пользователь просит:\n"
+            '- "добавь задачу/событие" → используй [TASK: ...]\n'
+            '- "удали всё / очисти календарь" → используй [CAL_DELETE_ALL]\n'
+            '- "удали событие X" → используй [CAL_DELETE: id]\n'
+            '- "перенеси / измени событие" → используй [CAL_UPDATE: id | ...]\n'
+            '- "покажи события" → ответь на основе списка ниже\n\n'
+            + cal_events_block
+        )
+    else:
+        cal_block = "❌ Не подключён. Пользователь может подключить через /calendar. Не говори что у тебя нет интеграции с календарём — она есть, просто ещё не настроена."
 
     onboarding_block = ""
     if onboarding_mode:
@@ -1318,21 +1337,7 @@ Timeframe: today / tomorrow / week / month / longterm
 СФЕРЫ: {', '.join(SPHERES.values())}
 
 GOOGLE CALENDAR:
-{f"""✅ Подключён. Ты имеешь ПОЛНЫЙ доступ к Google Календарю пользователя.
-
-ДОБАВИТЬ событие → [TASK: название | приоритет | сфера | timeframe | HH:MM]
-УДАЛИТЬ ВСЕ события → [CAL_DELETE_ALL]
-УДАЛИТЬ одно событие → [CAL_DELETE: event_id]
-ИЗМЕНИТЬ событие → [CAL_UPDATE: event_id | новое название | YYYY-MM-DD | HH:MM]
-
-Когда пользователь просит:
-- "добавь задачу/событие" → используй [TASK: ...]
-- "удали всё из календаря" / "очисти календарь" → используй [CAL_DELETE_ALL]
-- "удали событие X" → используй [CAL_DELETE: id] (id из списка событий ниже)
-- "перенеси / измени событие" → используй [CAL_UPDATE: id | ...]
-- "покажи события" → ответь на основе списка событий ниже
-
-{cal_events_block}""" if uid and get_google_token(uid) else "❌ Не подключён. Пользователь может подключить через /calendar. Не говори что у тебя нет интеграции с календарём — она есть, просто ещё не настроена."}
+{cal_block}
 
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
