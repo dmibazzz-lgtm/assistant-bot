@@ -2088,30 +2088,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     clear_followup(uid)
-    voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
-    audio_bytes = await file.download_as_bytearray()
     await update.message.reply_text("Слушаю... 🎤")
-    text = await call_groq_voice(bytes(audio_bytes))
-    if not text:
-        await update.message.reply_text("Не смогла расшифровать( Попробуй ещё раз.")
-        return
-    user = get_user(uid)
-    profile = get_profile(uid)
-    onboarding_done = user[1]
-    system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
-    history = get_history(uid)
-    history.append({"role": "user", "content": text})
-    save_msg(uid, "user", f"[голосовое] {text}")
     try:
+        if not os.environ.get("GROQ_API_KEY"):
+            await update.message.reply_text(
+                "⚠️ Голосовые сообщения не настроены.\n\nНужно добавить GROQ_API_KEY в Railway → Variables.\nПолучи бесплатный ключ на console.groq.com")
+            return
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await file.download_as_bytearray()
+        text = await call_groq_voice(bytes(audio_bytes))
+        if not text:
+            await update.message.reply_text("Не смогла расшифровать( Попробуй ещё раз.")
+            return
+        user = get_user(uid)
+        profile = get_profile(uid)
+        onboarding_done = user[1]
+        system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
+        history = get_history(uid)
+        history.append({"role": "user", "content": text})
+        save_msg(uid, "user", f"[голосовое] {text}")
         response = await call_claude(history, system)
         clean = await process_response(uid, response)
         save_msg(uid, "assistant", clean)
         if "?" in clean:
             set_followup(uid)
-        await send_safe(update, f"_Ты сказал(а):_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
-    except:
-        await update.message.reply_text("Что-то пошло не так)")
+        await send_safe(update, f"_Ты сказала:_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
+    except Exception as e:
+        logging.error(f"Voice error uid={uid}: {e}")
+        await update.message.reply_text("Не смогла обработать голосовое( Попробуй ещё раз.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
