@@ -6,3 +6,8 @@ google-auth-oauthlib==0.8.0
 google-api-python-client
 aiohttp
 pytz
+matplotlib
+reportlab
+python-pptx
+numpy
+Pillow

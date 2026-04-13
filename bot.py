@@ -706,6 +706,195 @@ def generate_wheel_chart(uid):
         logging.error(f"Wheel chart error: {e}")
         return None
 
+# ── Gantt / Mood-Energy / Habits charts ──────────────────────────────────────
+
+def generate_gantt_chart(uid):
+    """Диаграмма Ганта: задачи по срокам и приоритетам."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        tasks = get_tasks(uid)
+        if not tasks:
+            return None
+
+        today = datetime.now().date()
+        PRIO_COLOR = {"urgent": "#FF6584", "important": "#FFCA3A", "normal": "#6C63FF"}
+        TIMEFRAME_DAYS = {"today": 0, "week": 7, "month": 30, "quarter": 90, "year": 365}
+
+        names, starts, durations, colors_list = [], [], [], []
+        for t in tasks[:15]:
+            tid, text, prio, sphere, tf, due = t
+            label = (text[:28] + "…") if len(text) > 28 else text
+            if due:
+                try:
+                    end = datetime.strptime(due[:10], "%Y-%m-%d").date()
+                    days_left = max((end - today).days, 0)
+                    dur = max(days_left, 1)
+                    start_day = 0
+                except Exception:
+                    start_day = 0; dur = TIMEFRAME_DAYS.get(tf, 7)
+            else:
+                start_day = 0; dur = TIMEFRAME_DAYS.get(tf, 7)
+            names.append(label); starts.append(start_day)
+            durations.append(dur); colors_list.append(PRIO_COLOR.get(prio, "#6C63FF"))
+
+        if not names:
+            return None
+
+        fig, ax = plt.subplots(figsize=(11, max(4, len(names) * 0.5 + 1)))
+        fig.patch.set_facecolor('#1a1a2e')
+        ax.set_facecolor('#16213e')
+
+        y_pos = np.arange(len(names))
+        ax.barh(y_pos, durations, left=starts, color=colors_list, height=0.6, alpha=0.85)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, color='#e0e0e0', fontsize=8)
+        ax.tick_params(colors='#aaa')
+        ax.spines[:].set_color('#444')
+        ax.set_xlabel("Дней до дедлайна", color='#aaa', fontsize=9)
+        ax.set_title("Диаграмма Ганта — задачи", color='#e0e0e0', pad=10)
+        ax.axvline(x=0, color='#888', linestyle='--', linewidth=0.8)
+
+        from matplotlib.patches import Patch
+        legend = [Patch(color="#FF6584", label="Срочно"),
+                  Patch(color="#FFCA3A", label="Важно"),
+                  Patch(color="#6C63FF", label="Обычно")]
+        ax.legend(handles=legend, facecolor='#1a1a2e', edgecolor='#444',
+                  labelcolor='#e0e0e0', fontsize=8, loc='lower right')
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        logging.error(f"Gantt chart error: {e}")
+        return None
+
+
+def generate_mood_energy_chart(uid):
+    """График настроения и энергии за 14 дней."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        mood_rows = get_mood_history(uid, 14)
+        energy_rows = get_energy_history(uid, 14)
+        if not mood_rows and not energy_rows:
+            return None
+
+        def rows_to_daily(rows, score_idx=0, date_idx=1):
+            from collections import defaultdict
+            daily = defaultdict(list)
+            for row in rows:
+                date_str = row[date_idx][:10]
+                daily[date_str].append(row[score_idx])
+            return {d: sum(v)/len(v) for d, v in daily.items()}
+
+        mood_daily = rows_to_daily(mood_rows, score_idx=0, date_idx=2)
+        energy_daily = rows_to_daily(energy_rows, score_idx=0, date_idx=1)
+
+        all_dates = sorted(set(list(mood_daily.keys()) + list(energy_daily.keys())))
+        if not all_dates:
+            return None
+
+        fig, ax = plt.subplots(figsize=(11, 4))
+        fig.patch.set_facecolor('#1a1a2e')
+        ax.set_facecolor('#16213e')
+        ax.spines[:].set_color('#444')
+        ax.tick_params(colors='#aaa')
+
+        x_labels = [d[5:] for d in all_dates]  # MM-DD
+
+        if mood_daily:
+            mood_vals = [mood_daily.get(d) for d in all_dates]
+            ax.plot(x_labels, mood_vals, 'o-', color='#FF6584', linewidth=2,
+                    label='Настроение', markersize=5)
+            ax.fill_between(x_labels, mood_vals, alpha=0.12, color='#FF6584')
+
+        if energy_daily:
+            energy_vals = [energy_daily.get(d) for d in all_dates]
+            ax.plot(x_labels, energy_vals, 's-', color='#FFCA3A', linewidth=2,
+                    label='Энергия', markersize=5)
+            ax.fill_between(x_labels, energy_vals, alpha=0.12, color='#FFCA3A')
+
+        ax.set_ylim(0, 11)
+        ax.set_ylabel("Баллы (1-10)", color='#aaa', fontsize=9)
+        ax.set_title("Настроение и энергия — 14 дней", color='#e0e0e0', pad=10)
+        ax.legend(facecolor='#1a1a2e', edgecolor='#444', labelcolor='#e0e0e0', fontsize=9)
+        plt.xticks(rotation=45, ha='right', fontsize=8)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        logging.error(f"Mood/energy chart error: {e}")
+        return None
+
+
+def generate_habit_chart(uid):
+    """График выполнения привычек за 14 дней."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        habits = get_habits(uid)
+        if not habits:
+            return None
+
+        cutoff = (datetime.now() - timedelta(days=14)).date().isoformat()
+        names, pcts = [], []
+        for hid, hname in habits[:10]:
+            rows = db_fetch(
+                "SELECT COUNT(*) FROM habit_log WHERE user_id=? AND habit_id=? AND log_date>=?",
+                (uid, hid, cutoff))
+            done_days = rows[0][0] if rows else 0
+            pct = round(done_days / 14 * 100)
+            names.append((hname[:20] + "…") if len(hname) > 20 else hname)
+            pcts.append(pct)
+
+        if not names:
+            return None
+
+        fig, ax = plt.subplots(figsize=(9, max(3, len(names) * 0.55 + 1)))
+        fig.patch.set_facecolor('#1a1a2e')
+        ax.set_facecolor('#16213e')
+        ax.spines[:].set_color('#444')
+        ax.tick_params(colors='#aaa')
+
+        colors_list = ['#6BCB77' if p >= 70 else '#FFCA3A' if p >= 40 else '#FF6584' for p in pcts]
+        y_pos = np.arange(len(names))
+        bars = ax.barh(y_pos, pcts, color=colors_list, height=0.6, alpha=0.85)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, color='#e0e0e0', fontsize=9)
+        ax.set_xlim(0, 105)
+        ax.set_xlabel("Выполнение (%)", color='#aaa', fontsize=9)
+        ax.set_title("Привычки — 14 дней", color='#e0e0e0', pad=10)
+        for bar, pct in zip(bars, pcts):
+            ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2,
+                    f"{pct}%", va='center', color='#e0e0e0', fontsize=8)
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        logging.error(f"Habit chart error: {e}")
+        return None
+
+
 # ── Инлайн-клавиатуры для трекеров ───────────────────────────────────────────
 
 def score_keyboard(prefix):
