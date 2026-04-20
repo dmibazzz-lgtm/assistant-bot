@@ -3293,6 +3293,38 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Быстро узнать свой user_id — нужно при первой настройке OWNER_ID."""
     await update.message.reply_text(f"Твой user_id: `{update.effective_user.id}`", parse_mode="Markdown")
 
+async def cmd_test_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверить как выглядит утреннее приветствие, не дожидаясь 8:00.
+    Доступно только OWNER_ID. НЕ трогает last_morning_sent — чтобы
+    настоящая рассылка всё равно прошла утром."""
+    uid = update.effective_user.id
+    if not OWNER_ID or uid != OWNER_ID:
+        await update.message.reply_text("Команда только для владельца бота.")
+        return
+    profile = get_profile(uid)
+    local_now = user_now(profile)
+    await update.message.reply_text("🧪 Генерирую утреннее приветствие (тестовая отправка)...")
+    try:
+        text = await _build_morning_text(uid, profile, local_now)
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+async def cmd_test_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестовая отправка вечернего приветствия. Только OWNER_ID."""
+    uid = update.effective_user.id
+    if not OWNER_ID or uid != OWNER_ID:
+        await update.message.reply_text("Команда только для владельца бота.")
+        return
+    profile = get_profile(uid)
+    local_now = user_now(profile)
+    await update.message.reply_text("🧪 Генерирую вечернее приветствие (тестовая отправка)...")
+    try:
+        text = await _build_evening_text(uid, profile, local_now)
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Админская статистика — только для OWNER_ID."""
     uid = update.effective_user.id
@@ -4075,36 +4107,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_safe(update, clean, main_keyboard() if onboarding_done else onboarding_keyboard())
 
-async def morning(context):
-    utc_now = datetime.now(timezone.utc)
-    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
-    # Рассылка с пэйсингом: Telegram бан-лимит ~30 сообщений/сек в сумме.
-    # 0.3с между юзерами = ~3 rps — безопасный режим даже на тысячах аккаунтов.
-    PACE_SEC = 0.3
-    for uid, pj in users:
-        profile = json.loads(pj)
-        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
-        if local_now.hour != 8:
-            continue
-        address = profile.get("address") or profile.get("name") or ""
-        today_tasks = get_today_tasks(uid)
-        urgent = get_tasks(uid, priority="urgent")
-        goals = get_goals(uid)
-        quote_text, quote_author = get_random_quote(uid)
-        notif_extras = profile.get("notif_extras", "")
+# ── Вспомогательные: защита от дублирующих рассылок ──────────────────────────
+# Причина проблемы с «тремя добрыми вечерами»: каждый перезапуск контейнера
+# на Railway создавал job_queue заново, и если местное время пользователя
+# всё ещё попадало в окно (8:00 для утра, 19:00 для вечера), сообщение
+# отправлялось ПОВТОРНО. Теперь сохраняем в профиле дату последней отправки
+# и пропускаем, если уже отправили сегодня.
 
-        task_block = ""
-        if today_tasks:
-            task_block = f"Задачи на сегодня:\n" + "\n".join([f"• {t[1]}" for t in today_tasks[:5]])
-        elif urgent:
-            task_block = f"Срочных задач: {len(urgent)}"
+def _mark_sent(uid: int, field: str, day_iso: str):
+    """Сохранить дату отправки в profile.<field> (атомарно через save_profile)."""
+    profile = get_profile(uid)
+    profile[field] = day_iso
+    save_profile(uid, profile)
 
-        goal_block = ""
-        if goals:
-            goal_block = "Активных целей: " + str(len(goals))
+def _already_sent_today(profile: dict, field: str, day_iso: str) -> bool:
+    return profile.get(field) == day_iso
 
-        system = build_system(profile, uid=uid)
-        prompt = f"""Сгенерируй утреннее уведомление для пользователя. Используй эти данные:
+async def _build_morning_text(uid: int, profile: dict, local_now: datetime) -> str:
+    """Генерирует текст утреннего сообщения (без отправки).
+    Выделено в отдельную функцию, чтобы команда /test_morning могла
+    переиспользовать ту же логику."""
+    address = profile.get("address") or profile.get("name") or ""
+    today_tasks = get_today_tasks(uid)
+    urgent = get_tasks(uid, priority="urgent")
+    goals = get_goals(uid)
+    quote_text, quote_author = get_random_quote(uid)
+    notif_extras = profile.get("notif_extras", "")
+
+    task_block = ""
+    if today_tasks:
+        task_block = f"Задачи на сегодня:\n" + "\n".join([f"• {t[1]}" for t in today_tasks[:5]])
+    elif urgent:
+        task_block = f"Срочных задач: {len(urgent)}"
+
+    goal_block = ""
+    if goals:
+        goal_block = "Активных целей: " + str(len(goals))
+
+    system = build_system(profile, uid=uid)
+    prompt = f"""Сгенерируй утреннее уведомление для пользователя. Используй эти данные:
 
 Обращение: {address}
 Дата: {local_now.strftime('%d.%m.%Y, %A')}
@@ -4125,38 +4166,18 @@ async def morning(context):
 - Цель — напомнить, что делать сегодня, и замотивировать
 
 Стиль: живой, тёплый, не формальный. Не больше 7 строк суммарно."""
+    return await call_claude([{"role": "user", "content": prompt}], system,
+                             model=MODEL_SMART, max_tokens=MAX_TOKENS_NOTIF)
 
-        try:
-            response = await call_claude([{"role": "user", "content": prompt}], system,
-                                         model=MODEL_SMART, max_tokens=MAX_TOKENS_NOTIF)
-            await context.bot.send_message(uid, response, parse_mode="Markdown")
-            save_msg(uid, "assistant", response)
-        except Exception as e:
-            logging.error(f"Morning notif error {uid}: {e}")
-        await asyncio.sleep(PACE_SEC)
-
-async def evening(context):
-    utc_now = datetime.now(timezone.utc)
-    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
-    PACE_SEC = 0.3
-    for uid, pj in users:
-        profile = json.loads(pj)
-        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
-        if local_now.hour != 19:
-            continue
-        address = profile.get("address") or profile.get("name") or ""
-        tasks = get_tasks(uid)
-        today_str = (utc_now + timedelta(hours=get_user_tz_offset(profile))).date().isoformat()
-        done_today = db_fetch("""SELECT text FROM tasks WHERE user_id=? AND done=1
-                                  AND done_at >= ?""", (uid, today_str))
-        stats = get_sphere_stats(uid)
-        inactive = set(SPHERE_KEYS) - set(stats.keys())
-
-        system = build_system(profile, uid=uid)
-        inactive_labels = ", ".join([SPHERES[s] for s in list(inactive)[:3]]) if inactive else ""
-        done_block = "\n".join([f"• {t[0]}" for t in done_today[:5]]) if done_today else "Нет данных"
-
-        prompt = f"""Сгенерируй вечернее уведомление для пользователя.
+async def _build_evening_text(uid: int, profile: dict, local_now: datetime) -> str:
+    address = profile.get("address") or profile.get("name") or ""
+    tasks = get_tasks(uid)
+    today_str = local_now.date().isoformat()
+    done_today = db_fetch("""SELECT text FROM tasks WHERE user_id=? AND done=1
+                              AND done_at >= ?""", (uid, today_str))
+    done_block = "\n".join([f"• {t[0]}" for t in done_today[:5]]) if done_today else "Нет данных"
+    system = build_system(profile, uid=uid)
+    prompt = f"""Сгенерируй вечернее уведомление для пользователя.
 
 Обращение: {address}
 Выполнено сегодня: {done_block}
@@ -4174,15 +4195,66 @@ async def evening(context):
 - Не упоминай «сферы без внимания»
 
 Стиль: мягкий, заботливый, человечный. Не более 6 строк суммарно."""
+    return await call_claude([{"role": "user", "content": prompt}], system,
+                             model=MODEL_SMART, max_tokens=MAX_TOKENS_NOTIF)
 
+async def morning(context):
+    utc_now = datetime.now(timezone.utc)
+    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
+    # Рассылка с пэйсингом: Telegram бан-лимит ~30 сообщений/сек в сумме.
+    # 0.3с между юзерами = ~3 rps — безопасный режим даже на тысячах аккаунтов.
+    PACE_SEC = 0.3
+    sent_count = 0
+    skipped_count = 0
+    for uid, pj in users:
+        profile = json.loads(pj)
+        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
+        if local_now.hour != 8:
+            continue
+        today_local = local_now.date().isoformat()
+        if _already_sent_today(profile, "last_morning_sent", today_local):
+            skipped_count += 1
+            continue
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system,
-                                         model=MODEL_SMART, max_tokens=MAX_TOKENS_NOTIF)
+            response = await _build_morning_text(uid, profile, local_now)
             await context.bot.send_message(uid, response, parse_mode="Markdown")
             save_msg(uid, "assistant", response)
+            _mark_sent(uid, "last_morning_sent", today_local)
+            sent_count += 1
+            logging.info(f"Morning sent to {uid} (local_date={today_local})")
+        except Exception as e:
+            logging.error(f"Morning notif error {uid}: {e}")
+        await asyncio.sleep(PACE_SEC)
+    if sent_count or skipped_count:
+        logging.info(f"Morning summary: sent={sent_count}, skipped_dup={skipped_count}")
+
+async def evening(context):
+    utc_now = datetime.now(timezone.utc)
+    users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
+    PACE_SEC = 0.3
+    sent_count = 0
+    skipped_count = 0
+    for uid, pj in users:
+        profile = json.loads(pj)
+        local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
+        if local_now.hour != 19:
+            continue
+        today_local = local_now.date().isoformat()
+        if _already_sent_today(profile, "last_evening_sent", today_local):
+            skipped_count += 1
+            continue
+        try:
+            response = await _build_evening_text(uid, profile, local_now)
+            await context.bot.send_message(uid, response, parse_mode="Markdown")
+            save_msg(uid, "assistant", response)
+            _mark_sent(uid, "last_evening_sent", today_local)
+            sent_count += 1
+            logging.info(f"Evening sent to {uid} (local_date={today_local})")
         except Exception as e:
             logging.error(f"Evening notif error {uid}: {e}")
         await asyncio.sleep(PACE_SEC)
+    if sent_count or skipped_count:
+        logging.info(f"Evening summary: sent={sent_count}, skipped_dup={skipped_count}")
 
 async def weekly_review(context):
     utc_now = datetime.now(timezone.utc)
@@ -4193,6 +4265,10 @@ async def weekly_review(context):
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
         if local_now.hour != 10 or local_now.weekday() != 6:
             continue
+        today_local = local_now.date().isoformat()
+        if _already_sent_today(profile, "last_weekly_sent", today_local):
+            continue
+        _mark_sent(uid, "last_weekly_sent", today_local)
         address = profile.get("address") or profile.get("name") or ""
         tasks = get_tasks(uid)
         goals = get_goals(uid)
@@ -4385,6 +4461,8 @@ def main():
     app.add_handler(CommandHandler("draw",          cmd_draw))
     app.add_handler(CommandHandler("presentation",  cmd_presentation))
     app.add_handler(CommandHandler("backup",        cmd_backup))
+    app.add_handler(CommandHandler("test_morning",  cmd_test_morning))
+    app.add_handler(CommandHandler("test_evening",  cmd_test_evening))
     # Команды и хендлеры монетизации — регистрируем только если PAYMENTS_ENABLED.
     # Код cmd_subscribe и Stars-handlers сохранён в файле на будущее.
     if PAYMENTS_ENABLED:
