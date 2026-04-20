@@ -415,6 +415,16 @@ def init_db():
         category TEXT,
         note TEXT,
         created_at TEXT)""")
+    # «Парковочная площадка» — темы, которые человек затронул в онбординге,
+    # но для которых сейчас не время. После завершения онбординга Нова
+    # вернётся к ним по запросу пользователя (кнопка «Узнай меня больше»
+    # или команда /parking).
+    c.execute("""CREATE TABLE IF NOT EXISTS parking_lot (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        topic TEXT,
+        created_at TEXT,
+        discussed_at TEXT)""")
 
     # Индексы для всех горячих выборок по user_id — без них
     # SQLite сканирует всю таблицу, что на 500+ юзерах даёт задержки в секундах.
@@ -433,6 +443,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_wins_user          ON wins(user_id, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_usage_user_day     ON usage_counters(user_id, day)",
         "CREATE INDEX IF NOT EXISTS idx_expenses_user      ON expenses(user_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_parking_user       ON parking_lot(user_id, discussed_at)",
     ]:
         try:
             c.execute(idx_sql)
@@ -451,7 +462,7 @@ USER_DATA_TABLES = [
     "sphere_activity", "google_tokens",
     "mood_log", "energy_log", "habits", "habit_log",
     "journal", "wins", "sent_quotes", "followup_queue",
-    "subscriptions", "usage_counters", "expenses",
+    "subscriptions", "usage_counters", "expenses", "parking_lot",
 ]
 
 def wipe_user_data(uid):
@@ -688,6 +699,33 @@ def get_pending_followups():
     threshold = (datetime.now() - timedelta(hours=1)).isoformat()
     return db_fetch("SELECT user_id, asked_at, attempts FROM followup_queue WHERE asked_at < ? AND attempts < 2",
                     (threshold,))
+
+# ── Parking lot (отложенные темы из онбординга) ──────────────────────────────
+
+def add_parking(uid: int, topic: str):
+    """Отметить, что человек затронул тему в онбординге, но разбор отложен."""
+    topic = topic.strip()
+    if not topic:
+        return
+    # Не дублируем
+    existing = db_fetchone("SELECT id FROM parking_lot WHERE user_id=? AND topic=? AND discussed_at IS NULL",
+                           (uid, topic))
+    if existing:
+        return
+    db_exec("INSERT INTO parking_lot (user_id, topic, created_at) VALUES (?,?,?)",
+            (uid, topic, datetime.now().isoformat()))
+
+def get_parking_topics(uid: int, only_open: bool = True) -> list[tuple]:
+    """Список тем. only_open=True — только неразобранные."""
+    if only_open:
+        return db_fetch("SELECT id, topic, created_at FROM parking_lot WHERE user_id=? AND discussed_at IS NULL ORDER BY id",
+                        (uid,))
+    return db_fetch("SELECT id, topic, created_at, discussed_at FROM parking_lot WHERE user_id=? ORDER BY id",
+                    (uid,))
+
+def mark_parking_discussed(topic_id: int):
+    db_exec("UPDATE parking_lot SET discussed_at=? WHERE id=?",
+            (datetime.now().isoformat(), topic_id))
 
 # ── Подписки и лимиты ─────────────────────────────────────────────────────────
 
@@ -1619,6 +1657,14 @@ def main_keyboard():
         [KeyboardButton("📊 Дашборд"), KeyboardButton("📅 План недели")]
     ], resize_keyboard=True)
 
+def onboarding_keyboard():
+    """Инлайн-кнопки, которые прикрепляются к каждому сообщению онбординга.
+    Показываются, пока onboarding_done=0."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Завершить знакомство", callback_data="finish_onboarding")],
+        [InlineKeyboardButton("💡 Узнай меня больше",   callback_data="know_me_more")],
+    ])
+
 def tasks_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Сегодня", callback_data="tasks_today"),
@@ -1841,82 +1887,106 @@ def build_system(profile, onboarding_mode=False, uid=None, cal_events=None):
     if onboarding_mode:
         onboarding_block = """
 ═══════════════════════════════════
-РЕЖИМ ОНБОРДИНГА — 5 ЭТАПОВ
+РЕЖИМ ОНБОРДИНГА — БЫСТРО И ПО ДЕЛУ
 ═══════════════════════════════════
 
-ТЫ ВЕДЁШЬ ПЕРВЫЙ РАЗГОВОР. Правила:
-- Строго один вопрос за раз — жди ответ перед следующим
-- Перед каждым этапом объявляй его: "📍 Этап N — Название"
-- Реагируй живо: цепляйся за детали, уточняй если что-то важное
-- Если человек говорит что не хочет онбординг → сразу напиши [PROFILE: onboarding_skipped=true] и скажи что готова работать, предложи /done
-- Начиная с этапа 2 — анализируй стиль человека (длина сообщений, тон, эмодзи) и зеркали его
-- Если видишь внутренний конфликт или сложность — мягко отрази и предложи вернуться позже
-- Всё фиксируй в профиль через [PROFILE: ключ=значение]
+ГЛАВНАЯ ЦЕЛЬ: за минимум сообщений собрать ключевые данные о человеке,
+чтобы дальше работать с ним осмысленно. НЕ превращай онбординг в терапию
+или длинный разговор — это быстрый старт. Глубокие темы поднимутся потом.
+
+ТВОЙ ТЕМП:
+- Один короткий вопрос → ответ → фиксируешь в [PROFILE:] → следующий
+- Не задавай уточняющих вопросов в онбординге даже если очень хочется
+- Если человек даёт развёрнутый ответ — коротко подтверди («поняла») и переходи дальше
+- Не анализируй, не интерпретируй, не давай советов во время онбординга
+- Перед каждым этапом объявляй его одной короткой строкой: "📍 Этап N из 5 — Название"
+- После каждого этапа — в конце сообщения пиши тег [STAGE: N] где N — только что завершённый этап
+
+ЕСЛИ ЧЕЛОВЕК ЗАТРОНУЛ СЛОЖНУЮ ТЕМУ:
+- НЕ разбирай её прямо сейчас. Онбординг — не место для глубокого разбора.
+- Запомни: в конце ответа добавь тег [PARKING: краткое описание темы]
+- В ответе коротко скажи: «Это важно — обязательно вернёмся после знакомства»
+- Пример: если говорит «у меня выгорание», ты фиксируешь [PARKING: выгорание]
+  и пишешь: «Слышу. Об этом поговорим отдельно после знакомства. Пока двигаемся дальше.»
+
+ЕСЛИ ЧЕЛОВЕК НЕ ХОЧЕТ ОНБОРДИНГ:
+- Сразу пиши [PROFILE: onboarding_skipped=true] и говоришь что готова работать
+- Предлагаешь нажать кнопку «Завершить знакомство» чтобы открыть меню
+
+КНОПКИ: у пользователя всегда есть две кнопки под чатом:
+- «✅ Завершить знакомство» — можно нажать в любой момент, онбординг прервётся, откроется меню
+- «💡 Узнай меня больше» — если сам хочет рассказать больше после онбординга
 
 ───────────────────────────────────
-ЭТАП 1 — ЗНАКОМСТВО
+ЭТАП 1 из 5 — КТО ТЫ
+Цель: имя, обращение, род занятий, город, часовой пояс.
 ───────────────────────────────────
-Вопросы по одному, в таком порядке:
-1. Как тебя зовут? И сразу: как к тебе обращаться?
-   → сохрани: [PROFILE: name=...] и [PROFILE: address=...]
-2. Расскажи о себе — кто ты, где живёшь, чем занимаешься, что для тебя важно в жизни.
-   Рассказывай открыто, если хочется добавить что-то ещё — не сдерживайся, пиши как есть.
-   → сохрани: [PROFILE: occupation=...], [PROFILE: location=...], [PROFILE: values=...]
-3. Какое у тебя сейчас время?
-   → вычисли часовой пояс и сохрани: [PROFILE: timezone=UTC+N]
+Вопросы строго по одному:
+1. «Как тебя зовут и как мне к тебе обращаться?»
+   → [PROFILE: name=...] [PROFILE: address=...]
+2. «Чем занимаешься и где живёшь?»
+   → [PROFILE: occupation=...] [PROFILE: location=...] [PROFILE: city=...]
+3. «Сколько сейчас времени у тебя?»
+   → вычисли часовой пояс → [PROFILE: timezone=UTC+N]
+В конце сообщения этапа: [STAGE: 1]
 
 ───────────────────────────────────
-ЭТАП 2 — КАК ТЫ УСТРОЕН
+ЭТАП 2 из 5 — КАК ТЕБЕ УДОБНО
+Цель: как общаться именно с этим человеком.
 ───────────────────────────────────
-1. Что тебя радует и заряжает в обычной жизни?
-   → [PROFILE: energizers=...]
-2. Как тебе комфортнее получать информацию — коротко и по делу или с деталями и объяснениями?
-   → [PROFILE: info_style=brief/detailed]
-3. Как реагируешь на прямую обратную связь — любишь честность или предпочитаешь мягче?
-   → [PROFILE: feedback_style=direct/soft]
-4. Как отдыхаешь и восстанавливаешься?
-   → [PROFILE: recovery=...]
+Одним сообщением три коротких вопроса подряд:
+- «Кратко или развёрнуто отвечать?»  → [PROFILE: info_style=brief/detailed]
+- «Прямо или мягко давать обратную связь?»  → [PROFILE: feedback_style=direct/soft]
+- «Что тебя заряжает — чтобы я знала и напоминала?»  → [PROFILE: energizers=...]
+В конце: [STAGE: 2]
 
 ───────────────────────────────────
-ЭТАП 3 — СФЕРЫ ЖИЗНИ
+ЭТАП 3 из 5 — КОЛЕСО ЖИЗНИ
+Цель: 10 сфер + приоритет.
 ───────────────────────────────────
-1. Покажи список и попроси оценить каждую от 1 до 10:
-   Работа · Финансы · Здоровье · Отношения · Семья · Саморазвитие · Творчество · Отдых · Духовность · Окружение
-   → сохрани: [PROFILE: spheres_score=работа:N,финансы:N,...]
-2. В какой сфере хочешь прогресс в первую очередь?
-   → [PROFILE: priority_sphere=...]
+Одним сообщением: список 10 сфер, просишь оценить каждую от 1 до 10
+через запятую (например: «работа 7, финансы 5, здоровье 8...»).
+Сферы: Работа, Финансы, Здоровье, Отношения, Семья, Саморазвитие, Творчество, Отдых, Духовность, Окружение.
+После ответа: сохрани [PROFILE: spheres_score=работа:7,финансы:5,...]
+Затем одним коротким вопросом: «Какая сфера в приоритете сейчас?»
+→ [PROFILE: priority_sphere=...]
+В конце: [STAGE: 3]
 
 ───────────────────────────────────
-ЭТАП 4 — ВСЁ ЧТО ЕСТЬ ПРЯМО СЕЙЧАС
+ЭТАП 4 из 5 — ВЫГРУЗКА
+Цель: собрать текущие задачи и тревоги.
 ───────────────────────────────────
-1. "Перенеси сюда всё что сейчас висит — в голове, в записях, в заметках, в мессенджерах.
-   Всё подряд — дела, идеи, тревоги, планы. Нова сама всё распределит по категориям."
-   → из ответа: добавляй [TASK: ...] для дел, [IDEA: ...] для идей
-   → срочные дела — [TASK: ... | urgent | general | today]
-   → планы на месяц — [TASK: ... | normal | general | month]
+Одним сообщением: «Выгрузи всё что сейчас висит — дела, идеи, тревоги, планы.
+Одним сообщением, списком или потоком — как удобно. Сама разберу.»
+Из ответа парси:
+- Срочные дела → [TASK: ... | urgent | general | today]
+- Обычные дела → [TASK: ... | normal | general | week]
+- Идеи и желания → [IDEA: ... | general]
+- Если человек упомянул выгорание/тревогу/конфликт — [PARKING: тема]
+Коротко подтверди: «Записала X задач и Y идей.»
+В конце: [STAGE: 4]
 
 ───────────────────────────────────
-ЭТАП 5 — ЦЕЛИ, МЕЧТЫ, ИДЕИ
+ЭТАП 5 из 5 — КУДА ДВИЖЕМСЯ
+Цель: большая цель + 2-3 краткосрочных + что мешает.
 ───────────────────────────────────
-Вопросы по одному:
-1. Есть большая цель или мечта?
-   → [GOAL: ... | general | longterm]
-2. Краткосрочные и долгосрочные цели?
-   → [GOAL: ... | сфера | short/longterm]
-3. Идеи и желания которые давно лежат?
-   → [IDEA: ... | сфера]
-4. Хобби и интересы?
-   → [PROFILE: hobbies=...]
-5. Что чаще всего мешает двигаться вперёд?
+Три коротких вопроса по одному:
+1. «Какая у тебя большая цель или мечта — на год-два вперёд?»
+   → [GOAL: ... | priority_sphere | longterm]
+2. «Назови 2-3 конкретные цели на ближайшие 3 месяца.»
+   → [GOAL: ... | сфера | short] для каждой
+3. «Что чаще всего мешает двигаться к целям?»
    → [PROFILE: pain=...]
+В конце: [STAGE: 5]
 
 ───────────────────────────────────
 ЗАВЕРШЕНИЕ
 ───────────────────────────────────
-После всех этапов:
-- Сделай короткое тёплое резюме о человеке — покажи что ты его услышала
-- Скажи что готова работать
-- Предложи /done чтобы открыть главное меню
+После [STAGE: 5]:
+- Короткое (3-4 строки) тёплое резюме — 2-3 конкретных наблюдения о человеке
+- Если в PARKING что-то копилось — напомни: «Отложили на потом: [темы]. Вернёмся когда скажешь.»
+- Скажи что готова к работе и предложи нажать кнопку «✅ Завершить знакомство» для открытия меню
+- НЕ пиши /done сама — кнопка это делает
 """
 
     return f"""Ты — Нова. Профессиональный личный ассистент.
@@ -2243,6 +2313,15 @@ async def process_response(uid, text, skip_calendar=False, cal_plan_buffer=None)
                     k, _, v = pair.partition('=')
                     profile[k.strip()] = v.strip()
         save_profile(uid, profile)
+    # Прогресс онбординга: Нова объявляет завершение этапа тегом [STAGE: N]
+    for stage in re.findall(r'\[STAGE:\s*(\d+)\s*\]', text):
+        try:
+            update_user(uid, onboarding_step=int(stage))
+        except Exception:
+            pass
+    # Отложенные темы (на время онбординга): [PARKING: краткое описание темы]
+    for topic in re.findall(r'\[PARKING:\s*([^\]]+?)\s*\]', text):
+        add_parking(uid, topic)
     # Управление событиями Google Calendar
     if re.search(r'\[CAL_DELETE_ALL\]', text):
         deleted = await clear_all_calendar_events(uid)
@@ -2267,7 +2346,7 @@ async def process_response(uid, text, skip_calendar=False, cal_plan_buffer=None)
         if ok:
             cal_lines.append(f"✏️ Событие обновлено в календаре")
 
-    _TAGS = r'TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS|CAL_DELETE_ALL|CAL_DELETE|CAL_UPDATE|CAL_DELETE_CALENDAR|CAL_PLAN'
+    _TAGS = r'TASK|GOAL|IDEA|PROFILE|DONE_TASK|DEL_TASK|EDIT_TASK|GOAL_PROGRESS|CAL_DELETE_ALL|CAL_DELETE|CAL_UPDATE|CAL_DELETE_CALENDAR|CAL_PLAN|STAGE|PARKING|EXPENSE'
     # Полные теги (с закрывающей скобкой)
     text = re.sub(rf'\[({_TAGS}):[^\]]*\]', '', text, flags=re.DOTALL)
     text = re.sub(r'\[CAL_DELETE_ALL\]', '', text)
@@ -2322,6 +2401,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "noop":
         return
+    # ── Кнопки онбординга (отображаются под каждым сообщением Новы) ──
+    if data == "finish_onboarding":
+        # Завершаем онбординг принудительно — как будто юзер написал /done
+        update_user(uid, onboarding_done=1)
+        clear_followup(uid)
+        # Короткое тёплое завершение + основное меню
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        # Парковочные темы — напомним что они есть
+        parked = get_parking_topics(uid, only_open=True)
+        parked_hint = ""
+        if parked:
+            topics = ", ".join([t[1] for t in parked[:5]])
+            parked_hint = f"\n\nКстати, мы отложили на потом: _{topics}_. Скажи когда захочешь вернуться — запиши себе или просто напиши мне."
+        await query.message.reply_text(
+            f"Принято. Открываю меню — дальше работаем.{parked_hint}",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard())
+        return
+    if data == "know_me_more":
+        # Юзер хочет рассказать больше — подсказываем ему, что можно написать
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "Слушаю — расскажи что считаешь важным. Это может быть:\n"
+            "• что у тебя на душе\n"
+            "• чего ты хочешь\n"
+            "• чего избегаешь\n"
+            "• что беспокоит\n\n"
+            "Пиши как есть, я запишу.",
+            reply_markup=onboarding_keyboard())
+        return
     # ── Покупка подписки ──
     if data in ("buy_basic", "buy_pro"):
         if not PAYMENTS_ENABLED:
@@ -2334,6 +2449,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"send_invoice error uid={uid}: {e}")
             await query.message.reply_text(
                 "Не удалось создать счёт. Убедись что у тебя последняя версия Telegram.")
+        return
+    # ── Возврат к отложенной теме ──
+    if data.startswith("discuss_"):
+        try:
+            tid = int(data.split("_", 1)[1])
+        except Exception:
+            return
+        row = db_fetchone("SELECT topic FROM parking_lot WHERE id=? AND user_id=?", (tid, uid))
+        if not row:
+            await edit("Тема не найдена — возможно, уже разобрали.")
+            return
+        topic = row[0]
+        mark_parking_discussed(tid)
+        profile = get_profile(uid)
+        system = build_system(profile, uid=uid)
+        try:
+            response = await call_claude(
+                get_history(uid, limit=6) + [{"role": "user",
+                    "content": f"Давай сейчас вернёмся к теме, которую мы отложили в онбординге: «{topic}». "
+                               f"Задай один открытый вопрос, чтобы я начала рассказывать. Слушай и помогай распутать."}],
+                system, model=MODEL_SMART, max_tokens=MAX_TOKENS_DEFAULT)
+            clean = await process_response(uid, response)
+            await query.message.reply_text(clean, parse_mode="Markdown", reply_markup=main_keyboard())
+        except Exception as e:
+            logging.error(f"parking discuss error: {e}")
+            await query.message.reply_text(f"Окей, говорим про «{topic}». Расскажи что чувствуешь.",
+                                           reply_markup=main_keyboard())
+        return
+    if data == "parking_clear":
+        db_exec("UPDATE parking_lot SET discussed_at=? WHERE user_id=? AND discussed_at IS NULL",
+                (datetime.now().isoformat(), uid))
+        await edit("Хорошо — темы убрала из списка. Если всплывут снова, поговорим.")
         return
     # ── Подтверждение удаления данных (GDPR) ──
     if data == "delete_me_yes":
@@ -2796,6 +2943,28 @@ async def cmd_delete_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Это действие необратимо.*",
         parse_mode="Markdown", reply_markup=kb)
 
+# ── Отложенные темы (парковка) ───────────────────────────────────────────────
+
+async def cmd_parking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает темы, которые Нова отложила во время онбординга.
+    Пользователь выбирает одну — и Нова возвращается к разбору."""
+    uid = update.effective_user.id
+    topics = get_parking_topics(uid, only_open=True)
+    if not topics:
+        await update.message.reply_text(
+            "Отложенных тем нет — всё актуальное обсудили 🌿",
+            reply_markup=main_keyboard())
+        return
+    kb_rows = []
+    for tid, topic, _ in topics[:8]:
+        label = topic[:50]
+        kb_rows.append([InlineKeyboardButton(f"💬 {label}", callback_data=f"discuss_{tid}")])
+    kb_rows.append([InlineKeyboardButton("❌ Забыть всё это", callback_data="parking_clear")])
+    await update.message.reply_text(
+        "*Темы, которые мы отложили:*\nВыбери ту, о которой хочешь поговорить сейчас.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb_rows))
+
 # ── Админ / диагностика ──────────────────────────────────────────────────────
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3140,7 +3309,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_followup(uid)
         if onboarding_done:
             bump_usage(uid, "voice")
-        await send_safe(update, f"_Ты сказала:_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
+        await send_safe(update, f"_Ты сказала:_ {text}\n\n{clean}", main_keyboard() if onboarding_done else onboarding_keyboard())
     except Exception as e:
         logging.error(f"Voice error uid={uid}: {e}")
         await update.message.reply_text("Не смогла обработать голосовое( Попробуй ещё раз.")
@@ -3208,7 +3377,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_msg(uid, "assistant", clean)
         if onboarding_done:
             bump_usage(uid, "photo")
-        await send_safe(update, clean, main_keyboard() if onboarding_done else None)
+        await send_safe(update, clean, main_keyboard() if onboarding_done else onboarding_keyboard())
     except Exception as e:
         logging.error(f"Photo error: {e}")
         await update.message.reply_text("Не смогла обработать фото( Попробуй ещё раз.")
@@ -3244,7 +3413,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(history, system)
         clean = await process_response(uid, response, skip_calendar=not user[1])
         save_msg(uid, "assistant", clean)
-        await send_safe(update, clean, main_keyboard() if user[1] else None)
+        await send_safe(update, clean, main_keyboard() if user[1] else onboarding_keyboard())
     except Exception as e:
         logging.error(f"Doc error: {e}")
         await update.message.reply_text("Не смогла обработать документ(")
@@ -3267,7 +3436,7 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(history, system)
         clean = await process_response(uid, response, skip_calendar=not user[1])
         save_msg(uid, "assistant", clean)
-        await send_safe(update, clean, main_keyboard() if user[1] else None)
+        await send_safe(update, clean, main_keyboard() if user[1] else onboarding_keyboard())
     except:
         await update.message.reply_text("Что-то пошло не так)")
 
@@ -3530,7 +3699,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if onboarding_done:
         bump_usage(uid, "msg")
 
-    await send_safe(update, clean, main_keyboard() if onboarding_done else None)
+    await send_safe(update, clean, main_keyboard() if onboarding_done else onboarding_keyboard())
 
 async def morning(context):
     utc_now = datetime.now(timezone.utc)
@@ -3827,12 +3996,13 @@ def main():
     app.add_handler(CommandHandler("settings",cmd_settings))
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("plan",    cmd_plan))
-    # Новые команды: финансы, GDPR, админ (доступны всегда)
+    # Новые команды: финансы, GDPR, админ, парковка (доступны всегда)
     app.add_handler(CommandHandler("finance",   cmd_finance))
     app.add_handler(CommandHandler("export",    cmd_export))
     app.add_handler(CommandHandler("delete_me", cmd_delete_me))
     app.add_handler(CommandHandler("myid",      cmd_myid))
     app.add_handler(CommandHandler("admin",     cmd_admin))
+    app.add_handler(CommandHandler("parking",   cmd_parking))
     # Команды и хендлеры монетизации — регистрируем только если PAYMENTS_ENABLED.
     # Код cmd_subscribe и Stars-handlers сохранён в файле на будущее.
     if PAYMENTS_ENABLED:
@@ -3886,6 +4056,7 @@ def main():
         BotCommand("profile",  "Мой профиль"),
         BotCommand("plan",     "Недельный план — задачи + приоритеты"),
         BotCommand("finance",  "Мои траты (распознаю по фото чека)"),
+        BotCommand("parking",  "Вернуться к отложенным темам из знакомства"),
         BotCommand("export",   "Скачать все свои данные"),
         BotCommand("delete_me","Удалить все мои данные"),
     ]
