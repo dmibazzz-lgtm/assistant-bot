@@ -57,19 +57,10 @@ from config import (
     MAX_TOKENS_DEFAULT, MAX_TOKENS_ONBOARD, MAX_TOKENS_NOTIF,
     MAX_TOKENS_REVIEW, MAX_TOKENS_VISION,
 )
-
-def pick_model(messages):
-    """Возвращает (model_id, provider) где provider = 'claude' | 'openrouter'"""
-    last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-    if not isinstance(last, str):
-        return MODEL_SMART, "claude"
-    text = last.lower()
-    if len(last) > 50 or any(kw in text for kw in _SMART_KEYWORDS):
-        return MODEL_SMART, "claude"
-    # Дешёвые запросы — DeepSeek через OpenRouter если ключ есть
-    if OPENROUTER_API_KEY:
-        return MODEL_FAST_OPENROUTER, "openrouter"
-    return MODEL_FAST_CLAUDE, "claude"
+# Обёртки над внешними сервисами — Anthropic/OpenRouter/Groq/Mem0.
+from services.claude import pick_model, call_claude, call_claude_vision
+from services.mem0 import get_mem0, mem0_add, mem0_search, mem0_delete_all_user
+from services.voice import call_groq_voice
 
 
 _SQLITE_PRAGMA_APPLIED = False
@@ -1761,184 +1752,6 @@ GOOGLE CALENDAR:
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
 
-async def _call_openrouter(messages, system, model, max_tokens=MAX_TOKENS_DEFAULT):
-    """Вызов через OpenRouter (OpenAI-compatible API)."""
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": WEBHOOK_URL,
-        "X-Title": "Nova Assistant",
-    }
-    oai_messages = [{"role": "system", "content": system}] + messages
-    data = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": oai_messages,
-    }
-    async with httpx.AsyncClient() as client:
-        r = await client.post("https://openrouter.ai/api/v1/chat/completions",
-                              headers=headers, json=data, timeout=45)
-    result = r.json()
-    if "choices" not in result or not result["choices"]:
-        err = result.get("error", {}).get("message", str(result))
-        logging.error(f"OpenRouter error: {err}")
-        raise Exception(f"OpenRouter error: {err}")
-    return result["choices"][0]["message"]["content"]
-
-
-async def _call_claude_api(messages, system, model, max_tokens=MAX_TOKENS_DEFAULT, cache_system=True):
-    """Вызов через Anthropic API.
-
-    cache_system=True включает prompt caching: системный промпт помечается
-    cache_control=ephemeral, и Anthropic кэширует его на ~5 минут. При
-    следующих вызовах этот же system зачитывается из кэша по сниженной цене
-    (input cache hit = 10% от обычной цены input-токенов).
-    Для коротких system (<1024 токенов для Haiku / <2048 для Sonnet) кэш
-    просто игнорируется API — это безопасно.
-    """
-    headers = {
-        "x-api-key": CLAUDE_API_KEY.encode('ascii', 'ignore').decode('ascii'),
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    system_payload = (
-        [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
-        if cache_system else system
-    )
-    data = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_payload,
-        "messages": messages,
-    }
-    async with httpx.AsyncClient() as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-                              headers=headers, json=data, timeout=45)
-    result = r.json()
-    if "content" not in result:
-        err = result.get("error", {}).get("message", str(result))
-        logging.error(f"Claude API error: {err}")
-        # Если API ругается на cache_control (очень маловероятно) — повторяем без кэша
-        if cache_system and "cache" in err.lower():
-            return await _call_claude_api(messages, system, model, max_tokens, cache_system=False)
-        raise Exception(f"Claude API error: {err}")
-    # Полезная диагностика: сколько input-токенов было кэшировано
-    try:
-        usage = result.get("usage", {}) or {}
-        c_read = usage.get("cache_read_input_tokens", 0)
-        c_write = usage.get("cache_creation_input_tokens", 0)
-        if c_read or c_write:
-            logging.info(f"Claude usage: in={usage.get('input_tokens',0)} out={usage.get('output_tokens',0)} cache_read={c_read} cache_write={c_write}")
-    except Exception:
-        pass
-    return result["content"][0]["text"]
-
-
-async def call_claude(messages, system, model=None, max_tokens=MAX_TOKENS_DEFAULT):
-    if model is None:
-        model, provider = pick_model(messages)
-    elif model == MODEL_SMART:
-        provider = "claude"
-    elif OPENROUTER_API_KEY:
-        provider = "openrouter"
-        model = MODEL_FAST_OPENROUTER
-    else:
-        provider = "claude"
-    if provider == "openrouter":
-        try:
-            return await _call_openrouter(messages, system, model, max_tokens=max_tokens)
-        except Exception as e:
-            logging.warning(f"OpenRouter failed, fallback to Claude: {e}")
-            return await _call_claude_api(messages, system, MODEL_FAST_CLAUDE, max_tokens=max_tokens)
-    return await _call_claude_api(messages, system, model, max_tokens=max_tokens)
-
-async def call_claude_vision(image_b64, system, prompt="Опиши что на фото и извлеки любые задачи, планы или важную информацию."):
-    headers = {
-        "x-api-key": CLAUDE_API_KEY.encode('ascii', 'ignore').decode('ascii'),
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-    data = {
-        "model": MODEL_SMART,
-        "max_tokens": MAX_TOKENS_VISION,
-        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                {"type": "text", "text": prompt}
-            ]
-        }]
-    }
-    async with httpx.AsyncClient() as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-                              headers=headers, json=data, timeout=60)
-    return r.json()["content"][0]["text"]
-
-_mem0_client = None
-
-def get_mem0():
-    global _mem0_client
-    if _mem0_client is not None:
-        return _mem0_client
-    if not MEM0_API_KEY:
-        return None
-    try:
-        from mem0 import MemoryClient
-        _mem0_client = MemoryClient(api_key=MEM0_API_KEY)
-        return _mem0_client
-    except Exception as e:
-        logging.warning(f"Mem0 init failed: {e}")
-        return None
-
-async def mem0_add(uid: int, messages: list):
-    """Сохраняем новые сообщения диалога в Mem0 (async через executor)."""
-    import asyncio
-    mem = get_mem0()
-    if not mem:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, lambda: mem.add(messages, user_id=str(uid))
-        )
-    except Exception as e:
-        logging.warning(f"Mem0 add error: {e}")
-
-async def mem0_search(uid: int, query: str) -> str:
-    """Ищем релевантные воспоминания и возвращаем текстовый блок."""
-    import asyncio
-    mem = get_mem0()
-    if not mem:
-        return ""
-    try:
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, lambda: mem.search(query, user_id=str(uid), limit=5)
-        )
-        if not results:
-            return ""
-        memories = [r.get("memory", "") for r in results if r.get("memory")]
-        if not memories:
-            return ""
-        return "Долгосрочная память (из прошлых разговоров):\n" + "\n".join(f"• {m}" for m in memories)
-    except Exception as e:
-        logging.warning(f"Mem0 search error: {e}")
-        return ""
-
-async def call_groq_voice(audio_bytes):
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-    if not GROQ_API_KEY: return None
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
-            data={"model": "whisper-large-v3", "language": "ru"},
-            timeout=30
-        )
-    if r.status_code == 200: return r.json().get("text")
-    return None
 
 async def process_response(uid, text, skip_calendar=False, cal_plan_buffer=None):
     cal_lines = []
@@ -2708,18 +2521,6 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• *Всё что помню о тебе* — уберу долгосрочную память (то что ты рассказывала ранее). "
         "Профиль, задачи, цели тоже сохранятся.",
         parse_mode="Markdown", reply_markup=kb)
-
-def mem0_delete_all_user(uid: int):
-    """Удаляет все воспоминания пользователя из Mem0 (долгосрочной памяти)."""
-    mem = get_mem0()
-    if not mem:
-        return False
-    try:
-        mem.delete_all(user_id=str(uid))
-        return True
-    except Exception as e:
-        logging.warning(f"Mem0 delete_all failed for {uid}: {e}")
-        return False
 
 # ── /backup — экспорт БД (только для владельца) ──────────────────────────────
 
