@@ -1,4 +1,7 @@
-import os, sys, httpx, sqlite3, json, logging, re, base64, io, random
+from __future__ import annotations
+import os, sys, httpx, sqlite3, json, logging, re, base64, io, random, asyncio, time
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -8,7 +11,27 @@ from google.oauth2.credentials import Credentials
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
-logging.basicConfig(level=logging.INFO)
+
+# Логирование: консоль + файл с ротацией (10 МБ × 3 файла = 30 МБ лимит).
+# Ошибки всегда видно в nova.log — можно читать прямо на Railway.
+_log_fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+if not _root_logger.handlers:
+    _stream = logging.StreamHandler(sys.stdout)
+    _stream.setFormatter(logging.Formatter(_log_fmt))
+    _root_logger.addHandler(_stream)
+    try:
+        _file = RotatingFileHandler("nova.log", maxBytes=10_000_000, backupCount=3, encoding="utf-8")
+        _file.setFormatter(logging.Formatter(_log_fmt))
+        _root_logger.addHandler(_file)
+    except Exception as _e:
+        logging.warning(f"File logging disabled: {_e}")
+# Снижаем шум сторонних библиотек
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
@@ -19,6 +42,75 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://assistant-bot-production-6438.up.railway.app")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 MEM0_API_KEY = os.environ.get("MEM0_API_KEY")
+# ID владельца бота (ты сама) — твой telegram user_id. Узнать: напиши /myid боту.
+# Только этот пользователь видит /admin и некоторые диагностические команды.
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+
+# ── Тарифы и монетизация ──────────────────────────────────────────────────────
+# Цены в Telegram Stars (XTR). 1 Star ≈ 1.5-2 ₽.
+#
+# Модель монетизации:
+# - trial — выдаётся автоматически на 7 дней при первом /start.
+#           Доступ ко всем базовым возможностям, чтобы человек распробовал.
+#           После истечения — нужна платная подписка, чтобы продолжить.
+# - basic — структурирование жизни: задачи, цели, календарь, сферы, дневник,
+#           трекеры настроения/энергии/привычек, отчёты, голос, фото, финансы.
+# - pro   — всё из basic БЕЗ ЛИМИТОВ + приоритетная модель Sonnet
+#           + продвинутые AI-функции (генерация изображений, презентаций,
+#           расширенный контекст памяти и приоритетная поддержка).
+#
+# ⚠️ Чтобы поменять цены/лимиты — правь константы здесь. Ничего больше не нужно.
+PLANS = {
+    "trial": {
+        "title":           "Пробный",
+        "price_stars":     0,
+        "period_days":     7,       # 7 дней знакомства с ботом
+        "msg_daily":       50,
+        "voice_daily":     10,
+        "photo_daily":     10,
+        "calendar":        True,
+        "smart_model":     False,
+        "premium_ai":      False,
+        "description":     "7 дней бесплатного доступа ко всем базовым функциям.",
+    },
+    "basic": {
+        "title":           "Базовый",
+        "price_stars":     299,     # ~450-600 ₽/мес
+        "period_days":     30,
+        "msg_daily":       200,
+        "voice_daily":     30,
+        "photo_daily":     30,
+        "calendar":        True,
+        "smart_model":     False,
+        "premium_ai":      False,
+        "description":     (
+            "Полное структурирование жизни: задачи, цели, Google Calendar, "
+            "сферы жизни, дневник, трекеры настроения/энергии/привычек, графики, "
+            "PDF-отчёты, голос, фото, распознавание чеков, долгая память."
+        ),
+    },
+    "pro": {
+        "title":           "Pro",
+        "price_stars":     799,     # ~1200-1600 ₽/мес
+        "period_days":     30,
+        "msg_daily":       10**9,   # без лимита
+        "voice_daily":     10**9,
+        "photo_daily":     10**9,
+        "calendar":        True,
+        "smart_model":     True,    # всегда Sonnet — глубже отвечает
+        "premium_ai":      True,    # генерация изображений/презентаций, расширенный контекст
+        "description":     (
+            "Всё из Базового БЕЗ ЛИМИТОВ + приоритетная модель Sonnet + "
+            "продвинутые AI-функции: генерация изображений, создание презентаций, "
+            "расширенный контекст памяти, приоритетная поддержка."
+        ),
+    },
+}
+
+# После истечения триала или подписки get_user_plan возвращает эту метку.
+# Юзер всё ещё может читать свои данные (/today, /goals), но не может общаться
+# с Новой (вызывать LLM), пока не оформит подписку.
+PLAN_EXPIRED = "expired"
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -162,6 +254,26 @@ QUOTES = [
     ("Самопознание — начало всякой мудрости.", "Аристотель"),
 ]
 
+_SQLITE_PRAGMA_APPLIED = False
+
+def _apply_sqlite_pragma(conn):
+    """WAL-режим: параллельные чтения не блокируют записи, меньше I/O.
+    Применяем один раз за процесс — это настройки уровня файла БД."""
+    global _SQLITE_PRAGMA_APPLIED
+    if _SQLITE_PRAGMA_APPLIED:
+        return
+    try:
+        c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA temp_store=MEMORY")
+        c.execute("PRAGMA cache_size=-20000")  # 20 МБ кэша страниц
+        c.execute("PRAGMA busy_timeout=5000")  # ждём до 5с если БД занята
+        conn.commit()
+        _SQLITE_PRAGMA_APPLIED = True
+    except Exception as e:
+        logging.warning(f"SQLite PRAGMA failed: {e}")
+
 def get_conn(sync=True):
     if TURSO_URL and TURSO_TOKEN:
         try:
@@ -172,7 +284,9 @@ def get_conn(sync=True):
             return conn
         except Exception as e:
             logging.warning(f"Turso failed: {e}")
-    return sqlite3.connect("assistant.db")
+    conn = sqlite3.connect("assistant.db", timeout=5)
+    _apply_sqlite_pragma(conn)
+    return conn
 
 def init_db():
     conn = get_conn()
@@ -269,9 +383,76 @@ def init_db():
         user_id INTEGER,
         text TEXT,
         created_at TEXT)""")
+    # Подписка юзера: какой тариф, до какой даты действует.
+    c.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id INTEGER PRIMARY KEY,
+        plan TEXT DEFAULT 'free',
+        valid_until TEXT,
+        last_payment_stars INTEGER,
+        last_payment_at TEXT)""")
+    # Счётчик использования по дням. Ключ (user_id, day) — один ряд на юзера в сутки.
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_counters (
+        user_id INTEGER,
+        day TEXT,
+        kind TEXT,
+        count INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, day, kind))""")
+    # Распознанные чеки / траты (из фото или ручной ввод).
+    c.execute("""CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        currency TEXT DEFAULT 'RUB',
+        category TEXT,
+        note TEXT,
+        created_at TEXT)""")
+
+    # Индексы для всех горячих выборок по user_id — без них
+    # SQLite сканирует всю таблицу, что на 500+ юзерах даёт задержки в секундах.
+    for idx_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_messages_user      ON messages(user_id, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_user         ON tasks(user_id, done)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_user_due     ON tasks(user_id, due_date)",
+        "CREATE INDEX IF NOT EXISTS idx_goals_user         ON goals(user_id, done)",
+        "CREATE INDEX IF NOT EXISTS idx_ideas_user         ON ideas(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sphere_user_date   ON sphere_activity(user_id, activity_date)",
+        "CREATE INDEX IF NOT EXISTS idx_mood_user          ON mood_log(user_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_energy_user        ON energy_log(user_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_habits_user        ON habits(user_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_habitlog_user_date ON habit_log(user_id, log_date)",
+        "CREATE INDEX IF NOT EXISTS idx_journal_user       ON journal(user_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_wins_user          ON wins(user_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_usage_user_day     ON usage_counters(user_id, day)",
+        "CREATE INDEX IF NOT EXISTS idx_expenses_user      ON expenses(user_id, created_at)",
+    ]:
+        try:
+            c.execute(idx_sql)
+        except Exception as e:
+            logging.warning(f"Index skip: {e}")
+
     conn.commit()
     if hasattr(conn, 'sync'): conn.sync()
     conn.close()
+
+# Таблицы, которые принадлежат конкретному юзеру.
+# Используется в /reset, /newuser и "полном сбросе" из диалога —
+# раньше этот список дублировался в трёх местах.
+USER_DATA_TABLES = [
+    "users", "messages", "tasks", "goals", "ideas",
+    "sphere_activity", "google_tokens",
+    "mood_log", "energy_log", "habits", "habit_log",
+    "journal", "wins", "sent_quotes", "followup_queue",
+    "subscriptions", "usage_counters", "expenses",
+]
+
+def wipe_user_data(uid):
+    """Полное удаление всех данных пользователя. Используется в /reset, /newuser
+    и ручном сбросе через диалог."""
+    for t in USER_DATA_TABLES:
+        try:
+            db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
+        except Exception as e:
+            logging.warning(f"wipe {t} for {uid}: {e}")
 
 def db_exec(query, params=()):
     conn = get_conn()
@@ -299,6 +480,14 @@ def db_fetchone(query, params=()):
 
 def ensure_user(uid):
     db_exec("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+    # Одновременно заводим триальную подписку на 7 дней, если юзер новый.
+    # Функция ensure_subscription определена ниже — это ок, вызов в runtime.
+    try:
+        ensure_subscription(uid)
+    except NameError:
+        # Защита от случая, когда ensure_user вызывается до определения ensure_subscription
+        # (не должно случаться, но пусть будет).
+        pass
 
 def get_user(uid):
     return db_fetchone("SELECT * FROM users WHERE user_id=?", (uid,))
@@ -448,6 +637,35 @@ def get_random_quote(uid):
     db_exec("INSERT OR IGNORE INTO sent_quotes (user_id, quote_idx) VALUES (?,?)", (uid, idx))
     return QUOTES[idx]
 
+# ── Rate-limit ────────────────────────────────────────────────────────────────
+# Защита от потока сообщений от одного юзера (случайный цикл у клиента, троллинг,
+# баг в интеграции). Окно: не более 20 сообщений за 60 секунд + минимум 0.4с
+# между сообщениями. Цифры подобраны так, чтобы нормальный человек никогда
+# не упёрся в лимит, но массовый спам был отсечён до похода в LLM.
+
+_RATE_WINDOW_SEC = 60
+_RATE_MAX_IN_WINDOW = 20
+_RATE_MIN_GAP_SEC = 0.4
+_rate_buckets: dict[int, list[float]] = defaultdict(list)
+_rate_last: dict[int, float] = {}
+
+def check_rate_limit(uid: int) -> tuple[bool, str]:
+    """Возвращает (allowed, reason). reason — причина отказа, если allowed=False."""
+    now = time.time()
+    last = _rate_last.get(uid, 0.0)
+    if now - last < _RATE_MIN_GAP_SEC:
+        return False, "too_fast"
+    bucket = _rate_buckets[uid]
+    cutoff = now - _RATE_WINDOW_SEC
+    # Чистим старые записи
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= _RATE_MAX_IN_WINDOW:
+        return False, "too_many"
+    bucket.append(now)
+    _rate_last[uid] = now
+    return True, ""
+
 # ── Follow-up ─────────────────────────────────────────────────────────────────
 
 def set_followup(uid):
@@ -461,6 +679,145 @@ def get_pending_followups():
     threshold = (datetime.now() - timedelta(hours=1)).isoformat()
     return db_fetch("SELECT user_id, asked_at, attempts FROM followup_queue WHERE asked_at < ? AND attempts < 2",
                     (threshold,))
+
+# ── Подписки и лимиты ─────────────────────────────────────────────────────────
+
+def ensure_subscription(uid: int):
+    """Если у юзера ещё нет записи подписки — создаём триал на 7 дней.
+    Вызывается при первом обращении. Повторные вызовы безопасны — INSERT OR IGNORE."""
+    row = db_fetchone("SELECT user_id FROM subscriptions WHERE user_id=?", (uid,))
+    if row:
+        return
+    cfg = PLANS["trial"]
+    valid_until = (datetime.now() + timedelta(days=cfg["period_days"])).isoformat()
+    db_exec("""INSERT OR IGNORE INTO subscriptions (user_id, plan, valid_until, last_payment_stars, last_payment_at)
+               VALUES (?,?,?,?,?)""",
+            (uid, "trial", valid_until, 0, datetime.now().isoformat()))
+
+def get_user_plan(uid: int) -> str:
+    """Возвращает текущий активный тариф: 'trial' | 'basic' | 'pro' | 'expired'.
+    Если подписка истекла — возвращает 'expired' (не 'trial' — второго триала нет)."""
+    row = db_fetchone("SELECT plan, valid_until FROM subscriptions WHERE user_id=?", (uid,))
+    if not row:
+        # Записи нет — значит это самый первый заход. Функция ensure_subscription()
+        # создаст триал. Пока возвращаем 'trial' как дефолт.
+        return "trial"
+    plan, valid_until = row
+    if not valid_until:
+        return plan or "expired"
+    try:
+        if datetime.fromisoformat(valid_until) < datetime.now():
+            return PLAN_EXPIRED
+    except Exception:
+        return PLAN_EXPIRED
+    return plan
+
+def activate_plan(uid: int, plan: str, stars_paid: int = 0):
+    """Активировать/продлить тариф. Если подписка ещё активна — дни прибавляются к остатку."""
+    cfg = PLANS.get(plan)
+    if not cfg:
+        return
+    days = cfg["period_days"]
+    now = datetime.now()
+    if days > 0:
+        current = db_fetchone("SELECT valid_until FROM subscriptions WHERE user_id=?", (uid,))
+        base = now
+        if current and current[0]:
+            try:
+                existing = datetime.fromisoformat(current[0])
+                if existing > now:
+                    base = existing
+            except Exception:
+                pass
+        valid_until = (base + timedelta(days=days)).isoformat()
+    else:
+        valid_until = None
+    db_exec("""INSERT INTO subscriptions (user_id, plan, valid_until, last_payment_stars, last_payment_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   plan=excluded.plan,
+                   valid_until=excluded.valid_until,
+                   last_payment_stars=excluded.last_payment_stars,
+                   last_payment_at=excluded.last_payment_at""",
+            (uid, plan, valid_until, stars_paid, now.isoformat()))
+
+def days_left(uid: int) -> int:
+    """Сколько дней осталось до конца текущей подписки. -1 если нет подписки."""
+    row = db_fetchone("SELECT valid_until FROM subscriptions WHERE user_id=?", (uid,))
+    if not row or not row[0]:
+        return -1
+    try:
+        remaining = datetime.fromisoformat(row[0]) - datetime.now()
+        return max(0, remaining.days)
+    except Exception:
+        return -1
+
+def today_key(profile: dict | None = None) -> str:
+    """Дата пользователя в формате YYYY-MM-DD — по его локальному времени.
+    Если профиль не передан, по UTC (для внутренних счётчиков это не критично)."""
+    if profile:
+        return user_now(profile).date().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
+
+def get_usage(uid: int, kind: str, day: str | None = None) -> int:
+    day = day or today_key()
+    row = db_fetchone("SELECT count FROM usage_counters WHERE user_id=? AND day=? AND kind=?",
+                      (uid, day, kind))
+    return row[0] if row else 0
+
+def bump_usage(uid: int, kind: str = "msg"):
+    day = today_key()
+    db_exec("""INSERT INTO usage_counters (user_id, day, kind, count)
+               VALUES (?,?,?,1)
+               ON CONFLICT(user_id, day, kind) DO UPDATE SET count = count + 1""",
+            (uid, day, kind))
+
+def check_plan_limit(uid: int, kind: str = "msg") -> tuple[bool, str]:
+    """Проверяет доступ и дневной лимит.
+    kind: 'msg' | 'voice' | 'photo'. Возвращает (ok, reason_text).
+    Сам счётчик НЕ инкрементирует — это делает bump_usage() после успешной обработки."""
+    plan = get_user_plan(uid)
+    if plan == PLAN_EXPIRED:
+        return False, (
+            "⏸ Твой доступ к Нове закончился.\n\n"
+            "Чтобы продолжить — оформи подписку: /subscribe\n"
+            "Все твои задачи, цели и история сохранились — они подхватятся автоматически."
+        )
+    cfg = PLANS.get(plan, PLANS["trial"])
+    limit_key = {"msg": "msg_daily", "voice": "voice_daily", "photo": "photo_daily"}.get(kind, "msg_daily")
+    limit = cfg.get(limit_key, 0)
+    used = get_usage(uid, kind)
+    if used >= limit:
+        upgrade_hint = "" if plan == "pro" else " Напиши /subscribe чтобы снять лимиты."
+        kind_ru = {"msg": "сообщений", "voice": "голосовых", "photo": "фото"}.get(kind, kind)
+        return False, (f"⏸ Ты достигла дневного лимита ({limit} {kind_ru}/день) на тарифе *{cfg['title']}*."
+                       f"{upgrade_hint}")
+    return True, ""
+
+def user_has_feature(uid: int, feature: str) -> bool:
+    """feature: 'calendar' | 'smart_model' | 'premium_ai' — проверка доступа по тарифу."""
+    plan = get_user_plan(uid)
+    if plan == PLAN_EXPIRED:
+        return False
+    cfg = PLANS.get(plan, PLANS["trial"])
+    return bool(cfg.get(feature, False))
+
+# ── Траты (распознанные чеки) ─────────────────────────────────────────────────
+
+def add_expense(uid: int, amount: float, category: str, note: str = "", currency: str = "RUB"):
+    db_exec("INSERT INTO expenses (user_id, amount, currency, category, note, created_at) VALUES (?,?,?,?,?,?)",
+            (uid, amount, currency, category, note, datetime.now().isoformat()))
+
+def get_expenses_summary(uid: int, days: int = 30) -> dict:
+    """Сводка трат за N дней. Возвращает {'total': float, 'by_category': {cat: sum}, 'count': int}."""
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = db_fetch("SELECT amount, category FROM expenses WHERE user_id=? AND created_at>=?",
+                    (uid, since))
+    total = sum(r[0] or 0 for r in rows)
+    by_cat: dict = {}
+    for amt, cat in rows:
+        by_cat[cat or "прочее"] = by_cat.get(cat or "прочее", 0) + (amt or 0)
+    return {"total": total, "by_category": by_cat, "count": len(rows)}
 
 # ── Визуальные отчёты ─────────────────────────────────────────────────────────
 
@@ -1624,7 +1981,17 @@ GOOGLE CALENDAR:
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
 
-async def _call_openrouter(messages, system, model):
+# Лимиты вывода по ролям запроса. Раньше везде было 1000 — переплата впустую,
+# потому что средний ответ Новы 150-300 токенов. Уменьшение max_tokens не режет
+# ответы (там прописано "не больше N строк" в промпте), но защищает от случаев
+# когда модель начинает зацикливаться или выдавать простыню.
+MAX_TOKENS_DEFAULT  = 700    # обычный диалог
+MAX_TOKENS_ONBOARD  = 1000   # онбординг — бывают длинные ответы с разбором
+MAX_TOKENS_NOTIF    = 500    # утро / вечер — короткие приветствия
+MAX_TOKENS_REVIEW   = 900    # еженедельный и месячный разбор
+MAX_TOKENS_VISION   = 800    # фото — описание + извлечение задач
+
+async def _call_openrouter(messages, system, model, max_tokens=MAX_TOKENS_DEFAULT):
     """Вызов через OpenRouter (OpenAI-compatible API)."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -1635,7 +2002,7 @@ async def _call_openrouter(messages, system, model):
     oai_messages = [{"role": "system", "content": system}] + messages
     data = {
         "model": model,
-        "max_tokens": 1000,
+        "max_tokens": max_tokens,
         "messages": oai_messages,
     }
     async with httpx.AsyncClient() as client:
@@ -1649,17 +2016,29 @@ async def _call_openrouter(messages, system, model):
     return result["choices"][0]["message"]["content"]
 
 
-async def _call_claude_api(messages, system, model):
-    """Вызов через Anthropic API."""
+async def _call_claude_api(messages, system, model, max_tokens=MAX_TOKENS_DEFAULT, cache_system=True):
+    """Вызов через Anthropic API.
+
+    cache_system=True включает prompt caching: системный промпт помечается
+    cache_control=ephemeral, и Anthropic кэширует его на ~5 минут. При
+    следующих вызовах этот же system зачитывается из кэша по сниженной цене
+    (input cache hit = 10% от обычной цены input-токенов).
+    Для коротких system (<1024 токенов для Haiku / <2048 для Sonnet) кэш
+    просто игнорируется API — это безопасно.
+    """
     headers = {
         "x-api-key": CLAUDE_API_KEY.encode('ascii', 'ignore').decode('ascii'),
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    system_payload = (
+        [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        if cache_system else system
+    )
     data = {
         "model": model,
-        "max_tokens": 1000,
-        "system": system,
+        "max_tokens": max_tokens,
+        "system": system_payload,
         "messages": messages,
     }
     async with httpx.AsyncClient() as client:
@@ -1669,11 +2048,23 @@ async def _call_claude_api(messages, system, model):
     if "content" not in result:
         err = result.get("error", {}).get("message", str(result))
         logging.error(f"Claude API error: {err}")
+        # Если API ругается на cache_control (очень маловероятно) — повторяем без кэша
+        if cache_system and "cache" in err.lower():
+            return await _call_claude_api(messages, system, model, max_tokens, cache_system=False)
         raise Exception(f"Claude API error: {err}")
+    # Полезная диагностика: сколько input-токенов было кэшировано
+    try:
+        usage = result.get("usage", {}) or {}
+        c_read = usage.get("cache_read_input_tokens", 0)
+        c_write = usage.get("cache_creation_input_tokens", 0)
+        if c_read or c_write:
+            logging.info(f"Claude usage: in={usage.get('input_tokens',0)} out={usage.get('output_tokens',0)} cache_read={c_read} cache_write={c_write}")
+    except Exception:
+        pass
     return result["content"][0]["text"]
 
 
-async def call_claude(messages, system, model=None):
+async def call_claude(messages, system, model=None, max_tokens=MAX_TOKENS_DEFAULT):
     if model is None:
         model, provider = pick_model(messages)
     elif model == MODEL_SMART:
@@ -1685,11 +2076,11 @@ async def call_claude(messages, system, model=None):
         provider = "claude"
     if provider == "openrouter":
         try:
-            return await _call_openrouter(messages, system, model)
+            return await _call_openrouter(messages, system, model, max_tokens=max_tokens)
         except Exception as e:
             logging.warning(f"OpenRouter failed, fallback to Claude: {e}")
-            return await _call_claude_api(messages, system, MODEL_FAST_CLAUDE)
-    return await _call_claude_api(messages, system, model)
+            return await _call_claude_api(messages, system, MODEL_FAST_CLAUDE, max_tokens=max_tokens)
+    return await _call_claude_api(messages, system, model, max_tokens=max_tokens)
 
 async def call_claude_vision(image_b64, system, prompt="Опиши что на фото и извлеки любые задачи, планы или важную информацию."):
     headers = {
@@ -1699,8 +2090,8 @@ async def call_claude_vision(image_b64, system, prompt="Опиши что на �
     }
     data = {
         "model": MODEL_SMART,
-        "max_tokens": 1000,
-        "system": system,
+        "max_tokens": MAX_TOKENS_VISION,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{
             "role": "user",
             "content": [
@@ -1919,6 +2310,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "noop":
         return
+    # ── Покупка подписки ──
+    if data in ("buy_basic", "buy_pro"):
+        plan_key = data.split("_", 1)[1]
+        try:
+            await send_stars_invoice(context, uid, plan_key)
+        except Exception as e:
+            logging.error(f"send_invoice error uid={uid}: {e}")
+            await query.message.reply_text(
+                "Не удалось создать счёт. Убедись что у тебя последняя версия Telegram.")
+        return
+    # ── Подтверждение удаления данных (GDPR) ──
+    if data == "delete_me_yes":
+        wipe_user_data(uid)
+        await edit("🗑 Все твои данные удалены. Было приятно работать вместе. Если передумаешь — /start.")
+        return
+    if data == "delete_me_no":
+        await edit("Отменила удаление. Продолжаем 🌿")
+        return
     if data == "back_main":
         await edit("Главное меню 👇"); return
     if data == "back_spheres":
@@ -2056,6 +2465,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, onboarding_done=1)
+    # После завершения онбординга — убираем незакрытые follow-up,
+    # чтобы бот не возвращался к уже неактуальным вопросам настройки.
+    clear_followup(uid)
     profile = get_profile(uid)
     system = build_system(profile, uid=uid)
     try:
@@ -2185,15 +2597,224 @@ async def cmd_calinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_newuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    for t in ["users","messages","tasks","goals","ideas","sphere_activity","google_tokens",
-              "mood_log","energy_log","habits","habit_log","journal","wins",
-              "sent_quotes","followup_queue"]:
-        db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
+    wipe_user_data(uid)
     await update.message.reply_text("Сброс выполнен. Напиши /start")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_history(update.effective_user.id)
     await update.message.reply_text("История очищена.", reply_markup=main_keyboard())
+
+# ── Подписка / оплата через Telegram Stars ────────────────────────────────────
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущий статус подписки + кнопки для покупки Basic / Pro."""
+    uid = update.effective_user.id
+    ensure_user(uid)
+    plan = get_user_plan(uid)
+
+    # Текущий статус
+    if plan == PLAN_EXPIRED:
+        status = "⏸ *Доступ закончился.* Оформи подписку чтобы продолжить."
+    else:
+        cfg = PLANS[plan]
+        left = days_left(uid)
+        status_lines = [f"*Твой тариф: {cfg['title']}*"]
+        if left >= 0:
+            status_lines.append(f"_Осталось дней: {left}_")
+        status_lines.append("")
+        status_lines.append(
+            f"Сегодня использовано: {get_usage(uid,'msg')}/{cfg['msg_daily']} сообщений · "
+            f"{get_usage(uid,'voice')}/{cfg['voice_daily']} голос · "
+            f"{get_usage(uid,'photo')}/{cfg['photo_daily']} фото"
+        )
+        status = "\n".join(status_lines)
+
+    lines = [status, "", "*Что можно выбрать:*"]
+    for key in ("basic", "pro"):
+        p = PLANS[key]
+        lines.append(f"\n⭐ *{p['title']}* — {p['price_stars']} Stars / 30 дней")
+        lines.append(p['description'])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Оформить Базовый · {PLANS['basic']['price_stars']}⭐",
+                              callback_data="buy_basic")],
+        [InlineKeyboardButton(f"Оформить Pro · {PLANS['pro']['price_stars']}⭐",
+                              callback_data="buy_pro")],
+    ])
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+async def send_stars_invoice(context: ContextTypes.DEFAULT_TYPE, chat_id: int, plan_key: str):
+    """Отправляет инвойс Telegram Stars. provider_token для Stars должен быть пустой строкой."""
+    cfg = PLANS.get(plan_key)
+    if not cfg or cfg["price_stars"] <= 0:
+        return
+    from telegram import LabeledPrice
+    await context.bot.send_invoice(
+        chat_id=chat_id,
+        title=f"Нова — {cfg['title']} (30 дней)",
+        description=cfg["description"],
+        payload=f"plan:{plan_key}",
+        provider_token="",  # пусто = Telegram Stars
+        currency="XTR",
+        prices=[LabeledPrice(label=cfg["title"], amount=cfg["price_stars"])],
+    )
+
+async def handle_pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждаем платёж до списания. Telegram ждёт быстрый ответ."""
+    q = update.pre_checkout_query
+    try:
+        payload = q.invoice_payload or ""
+        if payload.startswith("plan:") and payload.split(":", 1)[1] in PLANS:
+            await q.answer(ok=True)
+        else:
+            await q.answer(ok=False, error_message="Не удалось распознать тариф. Попробуй /subscribe заново.")
+    except Exception as e:
+        logging.error(f"pre_checkout error: {e}")
+        try:
+            await q.answer(ok=False, error_message="Техническая ошибка. Попробуй позже.")
+        except Exception:
+            pass
+
+async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Активирует подписку после успешной оплаты Stars."""
+    msg = update.message
+    sp = msg.successful_payment
+    uid = update.effective_user.id
+    try:
+        payload = sp.invoice_payload or ""
+        plan_key = payload.split(":", 1)[1] if payload.startswith("plan:") else None
+        if plan_key not in PLANS:
+            await msg.reply_text("Платёж прошёл, но тариф не распознался. Напиши в поддержку.")
+            return
+        activate_plan(uid, plan_key, stars_paid=sp.total_amount)
+        cfg = PLANS[plan_key]
+        await msg.reply_text(
+            f"✨ Спасибо! Тариф *{cfg['title']}* активирован на 30 дней.\n"
+            f"Лимиты: {cfg['msg_daily']} сообщений, {cfg['voice_daily']} голос, {cfg['photo_daily']} фото в день.",
+            parse_mode="Markdown", reply_markup=main_keyboard())
+    except Exception as e:
+        logging.error(f"successful_payment error uid={uid}: {e}")
+        await msg.reply_text("Платёж получен, но возникла ошибка активации. Напиши /subscribe — мы разберёмся.")
+
+# ── Траты: команда /finance ───────────────────────────────────────────────────
+
+async def cmd_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    s = get_expenses_summary(uid, days=30)
+    if s["count"] == 0:
+        await update.message.reply_text(
+            "💳 Пока нет записанных трат.\n\n"
+            "Пришли мне фото чека — я сама извлеку сумму и категорию и добавлю в учёт.",
+            reply_markup=main_keyboard())
+        return
+    lines = [f"💳 *Траты за 30 дней:* {s['total']:.0f} ₽  _({s['count']} операций)_", ""]
+    for cat, amt in sorted(s["by_category"].items(), key=lambda x: -x[1]):
+        lines.append(f"• {cat}: {amt:.0f} ₽")
+    await send_safe(update, "\n".join(lines), main_keyboard())
+
+# ── GDPR / приватность ────────────────────────────────────────────────────────
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выгружает все данные юзера в текстовый файл и отправляет ему."""
+    uid = update.effective_user.id
+    lines = [f"# Экспорт данных пользователя {uid}", f"# Дата: {datetime.now().isoformat()}", ""]
+
+    profile = get_profile(uid)
+    if profile:
+        lines.append("## Профиль")
+        for k, v in profile.items():
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+
+    tasks = db_fetch("SELECT text, priority, timeframe, done, due_date, created_at FROM tasks WHERE user_id=?", (uid,))
+    if tasks:
+        lines.append(f"## Задачи ({len(tasks)})")
+        for t in tasks:
+            status = "✅" if t[3] else "⬜"
+            lines.append(f"{status} [{t[1]}/{t[2]}] {t[0]}  _(создано: {t[5] or '?'}, срок: {t[4] or '—'})_")
+        lines.append("")
+
+    goals = db_fetch("SELECT text, progress, done, created_at FROM goals WHERE user_id=?", (uid,))
+    if goals:
+        lines.append(f"## Цели ({len(goals)})")
+        for g in goals:
+            lines.append(f"- {g[0]} — {g[1]}% {'(выполнено)' if g[2] else ''}")
+        lines.append("")
+
+    ideas = db_fetch("SELECT text, created_at FROM ideas WHERE user_id=?", (uid,))
+    if ideas:
+        lines.append(f"## Идеи ({len(ideas)})")
+        for i in ideas:
+            lines.append(f"- {i[0]}")
+        lines.append("")
+
+    msgs = db_fetch("SELECT role, content, created_at FROM messages WHERE user_id=? ORDER BY id", (uid,))
+    if msgs:
+        lines.append(f"## Переписка ({len(msgs)} сообщений)")
+        for role, content, created in msgs:
+            lines.append(f"\n### [{created}] {role}")
+            lines.append(content)
+
+    exp = db_fetch("SELECT amount, category, note, created_at FROM expenses WHERE user_id=?", (uid,))
+    if exp:
+        lines.append(f"\n## Траты ({len(exp)})")
+        for amt, cat, note, created in exp:
+            lines.append(f"- [{created}] {amt} ₽ — {cat} ({note or '—'})")
+
+    data = "\n".join(lines).encode("utf-8")
+    bio = io.BytesIO(data)
+    bio.name = f"nova_export_{uid}.txt"
+    await update.message.reply_document(document=bio, filename=bio.name,
+                                        caption="📦 Здесь все твои данные в одном файле.")
+
+async def cmd_delete_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает подтверждение полного удаления данных."""
+    uid = update.effective_user.id
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, удалить всё",  callback_data="delete_me_yes"),
+        InlineKeyboardButton("Отмена",              callback_data="delete_me_no"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ Ты действительно хочешь удалить ВСЕ свои данные?\n\n"
+        "Будет удалено: профиль, задачи, цели, идеи, дневник, история переписки, "
+        "привычки, траты, подписка, все настройки.\n\n"
+        "*Это действие необратимо.*",
+        parse_mode="Markdown", reply_markup=kb)
+
+# ── Админ / диагностика ──────────────────────────────────────────────────────
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Быстро узнать свой user_id — нужно при первой настройке OWNER_ID."""
+    await update.message.reply_text(f"Твой user_id: `{update.effective_user.id}`", parse_mode="Markdown")
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админская статистика — только для OWNER_ID."""
+    uid = update.effective_user.id
+    if not OWNER_ID or uid != OWNER_ID:
+        await update.message.reply_text("Эта команда только для владельца бота.")
+        return
+    total_users = db_fetchone("SELECT COUNT(*) FROM users")[0]
+    active_today = db_fetchone(
+        "SELECT COUNT(DISTINCT user_id) FROM messages WHERE created_at >= ?",
+        ((datetime.now() - timedelta(days=1)).isoformat(),))[0]
+    active_7d = db_fetchone(
+        "SELECT COUNT(DISTINCT user_id) FROM messages WHERE created_at >= ?",
+        ((datetime.now() - timedelta(days=7)).isoformat(),))[0]
+    paid = db_fetchone(
+        "SELECT COUNT(*), COALESCE(SUM(last_payment_stars),0) FROM subscriptions WHERE plan!='free' AND valid_until > ?",
+        (datetime.now().isoformat(),))
+    msgs_24h = db_fetchone(
+        "SELECT COUNT(*) FROM messages WHERE created_at >= ? AND role='assistant'",
+        ((datetime.now() - timedelta(days=1)).isoformat(),))[0]
+    await update.message.reply_text(
+        "*📊 Статистика Новы*\n\n"
+        f"Всего юзеров: *{total_users}*\n"
+        f"Активных за сутки: *{active_today}*\n"
+        f"Активных за 7 дней: *{active_7d}*\n\n"
+        f"Платных подписок: *{paid[0] if paid else 0}*\n"
+        f"Всего Stars получено: *{paid[1] if paid else 0}⭐*\n\n"
+        f"Ответов Новы за 24ч: *{msgs_24h}*",
+        parse_mode="Markdown")
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2298,6 +2919,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /calendar — подключить Google Календарь
 /calshow — показать события в Calendar
 /report — отчёт, графики, PDF
+
+*💳 Финансы и подписка*
+/finance — траты за месяц (фото чека → учёт)
+/subscribe — мой тариф и подписка
+
+*🔒 Приватность*
+/export — скачать все мои данные
+/delete\_me — удалить меня и все данные
 
 Пишу в любом формате — текст, голос, фото 🎤📸"""
     await send_safe(update, text, main_keyboard())
@@ -2455,6 +3084,18 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    allowed, reason = check_rate_limit(uid)
+    if not allowed:
+        await update.message.reply_text("Секунду, я ещё с прошлым сообщением 🙏")
+        return
+    # Проверка тарифа: голос — отдельная квота
+    user_row = get_user(uid)
+    onboarding_done = bool(user_row and user_row[1])
+    if onboarding_done:
+        ok, msg = check_plan_limit(uid, kind="voice")
+        if not ok:
+            await update.message.reply_text(msg)
+            return
     clear_followup(uid)
     await update.message.reply_text("Слушаю... 🎤")
     try:
@@ -2469,9 +3110,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             await update.message.reply_text("Не смогла расшифровать( Попробуй ещё раз.")
             return
-        user = get_user(uid)
         profile = get_profile(uid)
-        onboarding_done = user[1]
         system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
         history = get_history(uid)
         history.append({"role": "user", "content": text})
@@ -2479,8 +3118,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(history, system)
         clean = await process_response(uid, response, skip_calendar=not onboarding_done)
         save_msg(uid, "assistant", clean)
-        if "?" in clean:
+        # Follow-up только в онбординге — см. комментарий в handle_message
+        if not onboarding_done and "?" in clean:
             set_followup(uid)
+        else:
+            clear_followup(uid)
+        if onboarding_done:
+            bump_usage(uid, "voice")
         await send_safe(update, f"_Ты сказала:_ {text}\n\n{clean}", main_keyboard() if onboarding_done else None)
     except Exception as e:
         logging.error(f"Voice error uid={uid}: {e}")
@@ -2489,6 +3133,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    allowed, _ = check_rate_limit(uid)
+    if not allowed:
+        await update.message.reply_text("Секунду, я ещё с прошлым сообщением 🙏")
+        return
+    user = get_user(uid)
+    onboarding_done = bool(user and user[1])
+    if onboarding_done:
+        ok, msg = check_plan_limit(uid, kind="photo")
+        if not ok:
+            await update.message.reply_text(msg)
+            return
     clear_followup(uid)
     await update.message.reply_text("Смотрю фото... 👀")
     photo = update.message.photo[-1]
@@ -2497,15 +3152,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_b64 = base64.b64encode(bytes(photo_bytes)).decode('utf-8')
     caption = update.message.caption or ""
     profile = get_profile(uid)
-    user = get_user(uid)
-    system = build_system(profile, onboarding_mode=not user[1], uid=uid)
-    prompt = f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} Опиши что видишь, извлеки задачи, планы, важную информацию."
+    system = build_system(profile, onboarding_mode=not onboarding_done, uid=uid)
+
+    # Подсказка модели: если на фото чек — нужно вернуть структурированный тег.
+    # Формат тега: [EXPENSE: сумма | категория | короткое описание]
+    # Примеры категорий: еда, транспорт, кафе, здоровье, дом, развлечения, одежда, прочее.
+    prompt = (
+        f"Пользователь прислал фото. {'Подпись: ' + caption if caption else ''} "
+        "Опиши что видишь, извлеки задачи, планы, важную информацию. "
+        "Если на фото ЧЕК или квитанция — обязательно добавь в конце отдельной строкой тег:\n"
+        "[EXPENSE: <итоговая сумма числом> | <категория одним словом: еда|транспорт|кафе|здоровье|"
+        "дом|развлечения|одежда|услуги|прочее> | <где потрачено / на что]\n"
+        "Не выдумывай сумму — если её не видно, просто напиши [EXPENSE: 0 | прочее | не видно суммы]."
+    )
     try:
         response = await call_claude_vision(image_b64, system, prompt)
-        clean = await process_response(uid, response, skip_calendar=not user[1])
+
+        # Парсим тег трат, сохраняем в expenses и удаляем из ответа юзеру
+        exp_added = None
+        m = re.search(r"\[EXPENSE:\s*([0-9]+(?:[.,][0-9]+)?)\s*\|\s*([^|\]]+?)\s*\|\s*([^\]]+?)\]",
+                      response, flags=re.IGNORECASE)
+        clean_text = response
+        if m:
+            try:
+                amount = float(m.group(1).replace(",", "."))
+                category = m.group(2).strip().lower()
+                note = m.group(3).strip()
+                if amount > 0:
+                    add_expense(uid, amount, category, note)
+                    exp_added = (amount, category, note)
+            except Exception as e:
+                logging.warning(f"Expense parse failed: {e}")
+            clean_text = re.sub(r"\[EXPENSE:[^\]]+\]", "", response).strip()
+
+        clean = await process_response(uid, clean_text, skip_calendar=not onboarding_done)
+        if exp_added:
+            amt, cat, note = exp_added
+            clean += f"\n\n💳 Записала трату: *{amt:g} ₽* — {cat} ({note})"
         save_msg(uid, "user", f"[фото] {caption}")
         save_msg(uid, "assistant", clean)
-        await send_safe(update, clean, main_keyboard() if user[1] else None)
+        if onboarding_done:
+            bump_usage(uid, "photo")
+        await send_safe(update, clean, main_keyboard() if onboarding_done else None)
     except Exception as e:
         logging.error(f"Photo error: {e}")
         await update.message.reply_text("Не смогла обработать фото( Попробуй ещё раз.")
@@ -2513,6 +3201,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    allowed, _ = check_rate_limit(uid)
+    if not allowed:
+        await update.message.reply_text("Секунду, я ещё с прошлым сообщением 🙏")
+        return
     clear_followup(uid)
     doc = update.message.document
     if not doc.mime_type or not doc.mime_type.startswith('text'):
@@ -2591,6 +3283,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
 
+    # Rate-limit: защита от цикла/спама — ДО любых LLM-вызовов.
+    allowed, reason = check_rate_limit(uid)
+    if not allowed:
+        if reason == "too_fast":
+            await update.message.reply_text("Секунду, я ещё отвечаю на прошлое... 🙏")
+        else:
+            await update.message.reply_text("Слишком много сообщений подряд. Давай сделаем паузу на минуту 🌿")
+        return
+
     if getattr(update.message, 'forward_origin', None) or getattr(update.message, 'forward_from', None) or getattr(update.message, 'forward_from_chat', None):
         await handle_forward(update, context)
         return
@@ -2608,6 +3309,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     profile = get_profile(uid)
     onboarding_done = user[1]
+
+    # Если подписка/триал истекли — блокируем ВСЕГДА (даже если онбординг не завершён).
+    # Иначе проверяем лимит только после онбординга — чтобы новый юзер мог пройти старт.
+    plan_now = get_user_plan(uid)
+    if plan_now == PLAN_EXPIRED:
+        ok, msg = check_plan_limit(uid, kind="msg")
+        await send_safe(update, msg, main_keyboard())
+        return
+    if onboarding_done:
+        ok, msg = check_plan_limit(uid, kind="msg")
+        if not ok:
+            await send_safe(update, msg, main_keyboard())
+            return
 
     # Загружаем события и список календарей если пользователь управляет Calendar
     cal_events = None
@@ -2666,9 +3380,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Секретные команды сброса
     if text.strip().lower() in ("полный сброс", "full reset"):
-        for t in ["users","messages","tasks","goals","ideas","sphere_activity","google_tokens",
-                  "mood_log","energy_log","habits","habit_log","journal","wins","sent_quotes","followup_queue"]:
-            db_exec(f"DELETE FROM {t} WHERE user_id=?", (uid,))
+        wipe_user_data(uid)
         await update.message.reply_text("Полный сброс выполнен. Напиши /start")
         return
     if text.strip().lower() == "сброс истории":
@@ -2754,8 +3466,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enriched_system = system + (f"\n\n{mem_block}" if mem_block else "")
 
     try:
-        model = MODEL_SMART if not onboarding_done else None
-        response = await call_claude(history, enriched_system, model=model)
+        # Во время онбординга — умная модель (Sonnet) + больший запас токенов
+        # на развёрнутые разборы. В обычном диалоге — авто-выбор (часто DeepSeek).
+        if not onboarding_done:
+            response = await call_claude(history, enriched_system,
+                                         model=MODEL_SMART, max_tokens=MAX_TOKENS_ONBOARD)
+        else:
+            response = await call_claude(history, enriched_system,
+                                         max_tokens=MAX_TOKENS_DEFAULT)
     except Exception as e:
         logging.error(f"Error: {e}")
         await update.message.reply_text("Что-то пошло не так... попробуй ещё раз)"); return
@@ -2768,8 +3486,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["cal_pending"] = cal_plan_buffer
 
     save_msg(uid, "assistant", clean)
-    if "?" in clean:
+    # Follow-up ставим ТОЛЬКО во время онбординга — чтобы помочь человеку
+    # закончить первичную настройку, если он ушёл из чата посередине.
+    # В обычном диалоге НЕ переспрашиваем: человек сам вернётся, если захочет.
+    if not onboarding_done and "?" in clean:
         set_followup(uid)
+    else:
+        # На случай, если followup остался с прошлого диалога — чистим,
+        # чтобы бот не задавал вопрос вдогонку уже завершённой теме.
+        clear_followup(uid)
 
     # Сохраняем диалог в Mem0 для долгосрочной памяти
     await mem0_add(uid, [
@@ -2785,11 +3510,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data.pop("potential_win", None)
 
+    # Счётчик лимита инкрементируем ПОСЛЕ успешной обработки — чтобы сбой
+    # в Claude не крал попытки.
+    if onboarding_done:
+        bump_usage(uid, "msg")
+
     await send_safe(update, clean, main_keyboard() if onboarding_done else None)
 
 async def morning(context):
     utc_now = datetime.now(timezone.utc)
     users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
+    # Рассылка с пэйсингом: Telegram бан-лимит ~30 сообщений/сек в сумме.
+    # 0.3с между юзерами = ~3 rps — безопасный режим даже на тысячах аккаунтов.
+    PACE_SEC = 0.3
     for uid, pj in users:
         profile = json.loads(pj)
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
@@ -2822,26 +3555,32 @@ async def morning(context):
 {goal_block}
 {f"Дополнительно включи: {notif_extras}" if notif_extras else ""}
 
-Структура:
-1. Тёплое приветствие с датой
-2. Цитата дня — выдели курсивом, подпись автора
-3. Один вопрос для самоанализа на сегодня (связан с целями или ситуацией пользователя)
-4. Задачи на сегодня (если есть)
-5. Короткое напутствие
+Структура (одним цельным сообщением, без лишних блоков):
+1. Тёплое короткое приветствие с датой
+2. Цитата дня — курсивом, с автором
+3. Напоминание о задачах на сегодня (если есть) — коротко, по делу
+4. Одна заряжающая фраза-мотивация на день
 
-Стиль: живой, тёплый, не формальный. Не больше 10 строк суммарно."""
+ВАЖНО:
+- НЕ задавай никаких вопросов пользователю — это приветствие, а не диалог
+- Не вставляй вопросы для самоанализа, рефлексии или уточняющие вопросы
+- Цель — напомнить, что делать сегодня, и замотивировать
+
+Стиль: живой, тёплый, не формальный. Не больше 7 строк суммарно."""
 
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
+            response = await call_claude([{"role": "user", "content": prompt}], system,
+                                         model=MODEL_SMART, max_tokens=MAX_TOKENS_NOTIF)
             await context.bot.send_message(uid, response, parse_mode="Markdown")
             save_msg(uid, "assistant", response)
-            set_followup(uid)
         except Exception as e:
             logging.error(f"Morning notif error {uid}: {e}")
+        await asyncio.sleep(PACE_SEC)
 
 async def evening(context):
     utc_now = datetime.now(timezone.utc)
     users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
+    PACE_SEC = 0.3
     for uid, pj in users:
         profile = json.loads(pj)
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
@@ -2864,28 +3603,33 @@ async def evening(context):
 Обращение: {address}
 Выполнено сегодня: {done_block}
 Открытых задач осталось: {len(tasks)}
-Сферы без внимания сегодня: {inactive_labels or 'все активны'}
 
-Структура:
+Структура (одним цельным сообщением):
 1. Тёплое вечернее приветствие
-2. Короткий итог дня — что сделано (не перечисляй всё, обобщи)
-3. Один вопрос для рефлексии — что дал этот день, что можно было сделать иначе
-4. Одно намерение или фокус на завтра
-5. Тёплое завершение — не сухое
+2. Короткий итог дня — что сделано (обобщённо, поддерживающе, не списком)
+3. Одно намерение или фокус на завтра
+4. «Программирование на удачу» — короткая вдохновляющая фраза-установка, которая настраивает на успех завтра (спокойно, по-взрослому, без пафоса)
 
-Стиль: мягкий, заботливый, человечный. Не более 8 строк."""
+ВАЖНО:
+- НЕ задавай никаких вопросов пользователю
+- Не спрашивай «что дал день» и не зови к рефлексии — пользователю этого не нужно в приветствии
+- Не упоминай «сферы без внимания»
+
+Стиль: мягкий, заботливый, человечный. Не более 6 строк суммарно."""
 
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
+            response = await call_claude([{"role": "user", "content": prompt}], system,
+                                         model=MODEL_SMART, max_tokens=MAX_TOKENS_NOTIF)
             await context.bot.send_message(uid, response, parse_mode="Markdown")
             save_msg(uid, "assistant", response)
-            set_followup(uid)
         except Exception as e:
             logging.error(f"Evening notif error {uid}: {e}")
+        await asyncio.sleep(PACE_SEC)
 
 async def weekly_review(context):
     utc_now = datetime.now(timezone.utc)
     users = db_fetch("SELECT user_id, profile FROM users WHERE onboarding_done=1")
+    PACE_SEC = 0.5
     for uid, pj in users:
         profile = json.loads(pj)
         local_now = utc_now + timedelta(hours=get_user_tz_offset(profile))
@@ -2924,7 +3668,8 @@ async def weekly_review(context):
 Стиль: глубже обычного, аналитично но по-человечески. Не более 12 строк."""
 
         try:
-            response = await call_claude([{"role": "user", "content": prompt}], system, model=MODEL_SMART)
+            response = await call_claude([{"role": "user", "content": prompt}], system,
+                                         model=MODEL_SMART, max_tokens=MAX_TOKENS_REVIEW)
 
             # Отправляем график перед текстом
             chart = generate_sphere_chart(uid)
@@ -2939,6 +3684,7 @@ async def weekly_review(context):
             await context.bot.send_message(uid, "Хочешь подробный PDF отчёт? Напиши /report")
         except Exception as e:
             logging.error(f"Weekly review error {uid}: {e}")
+        await asyncio.sleep(PACE_SEC)
 
 async def check_followup(context):
     pending = get_pending_followups()
@@ -2951,13 +3697,14 @@ async def check_followup(context):
                 history + [{"role": "user", "content":
                     "Я не ответил на твой последний вопрос. Переформулируй его иначе — коротко, с другой стороны. "
                     "Не упоминай что я молчал."}],
-                system, model=MODEL_SMART)
+                system, model=MODEL_SMART, max_tokens=MAX_TOKENS_DEFAULT)
             clean = await process_response(uid, response)
             await context.bot.send_message(uid, clean, parse_mode="Markdown")
             db_exec("UPDATE followup_queue SET asked_at=?, attempts=? WHERE user_id=?",
                     (datetime.now().isoformat(), attempts + 1, uid))
         except Exception as e:
             logging.error(f"Followup error {uid}: {e}")
+        await asyncio.sleep(0.3)
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -3065,10 +3812,21 @@ def main():
     app.add_handler(CommandHandler("settings",cmd_settings))
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("plan",    cmd_plan))
+    # Новые команды: подписка, финансы, GDPR, админ
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("finance",   cmd_finance))
+    app.add_handler(CommandHandler("export",    cmd_export))
+    app.add_handler(CommandHandler("delete_me", cmd_delete_me))
+    app.add_handler(CommandHandler("myid",      cmd_myid))
+    app.add_handler(CommandHandler("admin",     cmd_admin))
     # Скрытые команды — не показываются в меню BotFather
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("newuser", cmd_newuser))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # Платежи Telegram Stars
+    from telegram.ext import PreCheckoutQueryHandler
+    app.add_handler(PreCheckoutQueryHandler(handle_pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -3107,6 +3865,10 @@ def main():
         BotCommand("settings", "Настройки"),
         BotCommand("profile",  "Мой профиль"),
         BotCommand("plan",     "Недельный план — задачи + приоритеты"),
+        BotCommand("finance",  "Мои траты (распознаю по фото чека)"),
+        BotCommand("subscribe","Мой тариф и подписка"),
+        BotCommand("export",   "Скачать все свои данные"),
+        BotCommand("delete_me","Удалить все мои данные"),
     ]
 
     async def start_web(app_obj):

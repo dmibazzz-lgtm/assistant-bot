@@ -1,0 +1,30 @@
+# секреты
+.env
+.env.*
+!.env.example
+
+# логи
+*.log
+nova.log*
+
+# локальная БД
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+assistant.db*
+nova.db*
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
