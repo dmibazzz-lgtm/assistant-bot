@@ -12,6 +12,14 @@ from google.oauth2.credentials import Credentials
 # Большие константы-списки (цитаты дня, вопросы рефлексии) вынесены
 # в отдельный файл prompts.py — раньше они занимали 160+ строк в bot.py.
 from prompts import QUOTES, REFLECT_QUESTIONS
+# UI-клавиатуры и константа SPHERES. В bot.py остались только клавиатуры,
+# которые тянут данные из БД (habits_keyboard, settings_keyboard).
+from keyboards import (
+    SPHERES, SPHERE_KEYS,
+    score_keyboard, main_keyboard, onboarding_keyboard,
+    tasks_keyboard, goals_keyboard, spheres_keyboard, sphere_detail_keyboard,
+    task_actions_keyboard, move_timeframe_keyboard,
+)
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
@@ -37,117 +45,18 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
-TURSO_URL = os.environ.get("TURSO_URL")
-TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://assistant-bot-production-6438.up.railway.app")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-MEM0_API_KEY = os.environ.get("MEM0_API_KEY")
-# ID владельца бота (ты сама) — твой telegram user_id. Узнать: напиши /myid боту.
-# Только этот пользователь видит /admin и некоторые диагностические команды.
-OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
-# Replicate API — для генерации изображений через FLUX.1 Schnell (~$0.003 за картинку).
-# Получи ключ на replicate.com/account/api-tokens, положи в Railway как REPLICATE_API_TOKEN.
-# Без ключа — команда /draw выдаст сообщение "функция пока не настроена".
-REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
-
-# ── Feature flag: монетизация ─────────────────────────────────────────────────
-# Когда False — все проверки тарифов отключены, команды /subscribe и платежи
-# НЕ регистрируются, лимиты сообщений не применяются. Все юзеры получают
-# полный доступ бесплатно. Весь код ниже (PLANS, check_plan_limit, Stars-handlers)
-# СОХРАНЁН — чтобы включить обратно достаточно поставить True.
-#
-# Можно переопределить через переменную окружения PAYMENTS_ENABLED=true на Railway.
-PAYMENTS_ENABLED = os.environ.get("PAYMENTS_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-
-# ── Тарифы и монетизация ──────────────────────────────────────────────────────
-# Цены в Telegram Stars (XTR). 1 Star ≈ 1.5-2 ₽.
-#
-# Модель монетизации:
-# - trial — выдаётся автоматически на 7 дней при первом /start.
-#           Доступ ко всем базовым возможностям, чтобы человек распробовал.
-#           После истечения — нужна платная подписка, чтобы продолжить.
-# - basic — структурирование жизни: задачи, цели, календарь, сферы, дневник,
-#           трекеры настроения/энергии/привычек, отчёты, голос, фото, финансы.
-# - pro   — всё из basic БЕЗ ЛИМИТОВ + приоритетная модель Sonnet
-#           + продвинутые AI-функции (генерация изображений, презентаций,
-#           расширенный контекст памяти и приоритетная поддержка).
-#
-# ⚠️ Чтобы поменять цены/лимиты — правь константы здесь. Ничего больше не нужно.
-PLANS = {
-    "trial": {
-        "title":           "Пробный",
-        "price_stars":     0,
-        "period_days":     7,       # 7 дней знакомства с ботом
-        "msg_daily":       50,
-        "voice_daily":     10,
-        "photo_daily":     10,
-        "calendar":        True,
-        "smart_model":     False,
-        "premium_ai":      False,
-        "description":     "7 дней бесплатного доступа ко всем базовым функциям.",
-    },
-    "basic": {
-        "title":           "Базовый",
-        "price_stars":     299,     # ~450-600 ₽/мес
-        "period_days":     30,
-        "msg_daily":       200,
-        "voice_daily":     30,
-        "photo_daily":     30,
-        "calendar":        True,
-        "smart_model":     False,
-        "premium_ai":      False,
-        "description":     (
-            "Полное структурирование жизни: задачи, цели, Google Calendar, "
-            "сферы жизни, дневник, трекеры настроения/энергии/привычек, графики, "
-            "PDF-отчёты, голос, фото, распознавание чеков, долгая память."
-        ),
-    },
-    "pro": {
-        "title":           "Pro",
-        "price_stars":     799,     # ~1200-1600 ₽/мес
-        "period_days":     30,
-        "msg_daily":       10**9,   # без лимита
-        "voice_daily":     10**9,
-        "photo_daily":     10**9,
-        "calendar":        True,
-        "smart_model":     True,    # всегда Sonnet — глубже отвечает
-        "premium_ai":      True,    # генерация изображений/презентаций, расширенный контекст
-        "description":     (
-            "Всё из Базового БЕЗ ЛИМИТОВ + приоритетная модель Sonnet + "
-            "продвинутые AI-функции: генерация изображений, создание презентаций, "
-            "расширенный контекст памяти, приоритетная поддержка."
-        ),
-    },
-}
-
-# После истечения триала или подписки get_user_plan возвращает эту метку.
-# Юзер всё ещё может читать свои данные (/today, /goals), но не может общаться
-# с Новой (вызывать LLM), пока не оформит подписку.
-PLAN_EXPIRED = "expired"
-
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
-# Дорогие запросы — через Claude Sonnet
-MODEL_SMART = "claude-sonnet-4-6"
-# Дешёвые запросы — через OpenRouter DeepSeek V3 (или Haiku как fallback)
-MODEL_FAST_OPENROUTER = "deepseek/deepseek-chat-v3-0324"
-MODEL_FAST_CLAUDE     = "claude-haiku-4-5-20251001"
-
-_SMART_KEYWORDS = {
-    "цель", "цели", "анализ", "отчёт", "отчет", "сферы", "сфера",
-    "конфликт", "психолог", "рефлекси", "онбординг", "еженедельн",
-    "прогресс", "мечта", "мечты", "стратег", "глубок", "проблема",
-    "тревог", "кризис", "смысл", "ценност", "мотивац",
-    # Задачи и планирование — только Claude генерирует теги надёжно
-    "задач", "запиш", "добавь", "добавить", "напомни", "запланир",
-    "сделать", "сделай", "внеси", "поставь", "зафиксир", "отметь",
-    "календар", "перенеси", "удали", "выполни", "завтра", "сегодня",
-    "неделя", "неделе", "месяц", "дедлайн", "срок", "план",
-}
+# Вся конфигурация — секреты, тарифы, модели, лимиты токенов, ключевые слова —
+# вынесена в config.py. Правь цены и лимиты там.
+from config import (
+    TELEGRAM_TOKEN, CLAUDE_API_KEY, TURSO_URL, TURSO_TOKEN,
+    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, WEBHOOK_URL,
+    OPENROUTER_API_KEY, MEM0_API_KEY, OWNER_ID, REPLICATE_API_TOKEN,
+    SCOPES, PAYMENTS_ENABLED, PLANS, PLAN_EXPIRED,
+    MODEL_SMART, MODEL_FAST_OPENROUTER, MODEL_FAST_CLAUDE,
+    SMART_KEYWORDS as _SMART_KEYWORDS,
+    MAX_TOKENS_DEFAULT, MAX_TOKENS_ONBOARD, MAX_TOKENS_NOTIF,
+    MAX_TOKENS_REVIEW, MAX_TOKENS_VISION,
+)
 
 def pick_model(messages):
     """Возвращает (model_id, provider) где provider = 'claude' | 'openrouter'"""
@@ -1178,10 +1087,6 @@ def generate_habit_chart(uid):
 
 # ── Инлайн-клавиатуры для трекеров ───────────────────────────────────────────
 
-def score_keyboard(prefix):
-    row1 = [InlineKeyboardButton(str(i), callback_data=f"{prefix}_{i}") for i in range(1, 6)]
-    row2 = [InlineKeyboardButton(str(i), callback_data=f"{prefix}_{i}") for i in range(6, 11)]
-    return InlineKeyboardMarkup([row1, row2])
 
 def habits_keyboard(uid):
     habits = get_habits(uid)
@@ -1509,90 +1414,6 @@ def get_oauth_flow():
 
 # Цвета Google Calendar по приоритету задач
 PRIORITY_COLOR = {"urgent": "11", "important": "6", "normal": "7"}
-
-SPHERES = {
-    "work": "💼 Работа & Карьера",
-    "finance": "💰 Финансы & Деньги",
-    "family": "👨‍👩‍👧 Семья & Близкие",
-    "relations": "🤝 Отношения & Социум",
-    "health": "💛 Здоровье & Тело",
-    "psychology": "🧠 Психология & Внутреннее",
-    "growth": "🌱 Развитие & Обучение",
-    "energy": "✨ Энергия & Духовность",
-    "home": "🏠 Быт & Пространство",
-    "projects": "🎯 Проекты & Идеи",
-}
-SPHERE_KEYS = list(SPHERES.keys())
-
-def main_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("📋 Задачи"), KeyboardButton("🎯 Цели")],
-        [KeyboardButton("🌀 Сферы жизни"), KeyboardButton("💡 Идеи")],
-        [KeyboardButton("📊 Дашборд"), KeyboardButton("📅 План недели")]
-    ], resize_keyboard=True)
-
-def onboarding_keyboard():
-    """Инлайн-кнопки, которые прикрепляются к каждому сообщению онбординга.
-    Показываются, пока onboarding_done=0."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Завершить знакомство", callback_data="finish_onboarding")],
-        [InlineKeyboardButton("💡 Узнай меня больше",   callback_data="know_me_more")],
-    ])
-
-def tasks_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Сегодня", callback_data="tasks_today"),
-         InlineKeyboardButton("📆 Неделя", callback_data="tasks_week")],
-        [InlineKeyboardButton("🗓 Месяц", callback_data="tasks_month"),
-         InlineKeyboardButton("♾ Долгосрочные", callback_data="tasks_longterm")],
-        [InlineKeyboardButton("🔴 Срочные", callback_data="tasks_urgent"),
-         InlineKeyboardButton("✅ Выполненные", callback_data="tasks_done")],
-        [InlineKeyboardButton("📋 Все", callback_data="tasks_all"),
-         InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-    ])
-
-def goals_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Краткосрочные", callback_data="goals_short"),
-         InlineKeyboardButton("🏔 Долгосрочные", callback_data="goals_long")],
-        [InlineKeyboardButton("📋 Все цели", callback_data="goals_all"),
-         InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-    ])
-
-def spheres_keyboard():
-    buttons = []
-    items = list(SPHERES.items())
-    for i in range(0, len(items), 2):
-        row = [InlineKeyboardButton(label, callback_data=f"sphere_{key}")
-               for key, label in items[i:i+2]]
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
-    return InlineKeyboardMarkup(buttons)
-
-def sphere_detail_keyboard(sphere_key):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Задачи", callback_data=f"sph_tasks_{sphere_key}"),
-         InlineKeyboardButton("🎯 Цели", callback_data=f"sph_goals_{sphere_key}")],
-        [InlineKeyboardButton("💡 Идеи", callback_data=f"sph_ideas_{sphere_key}"),
-         InlineKeyboardButton("⬅️ К сферам", callback_data="back_spheres")]
-    ])
-
-def task_actions_keyboard(task_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Выполнено", callback_data=f"tdone_{task_id}"),
-         InlineKeyboardButton("🗑 Удалить", callback_data=f"tdel_{task_id}")],
-        [InlineKeyboardButton("📅 Перенести", callback_data=f"tmove_{task_id}"),
-         InlineKeyboardButton("⬅️ Назад", callback_data="tasks_all")]
-    ])
-
-def move_timeframe_keyboard(task_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Сегодня", callback_data=f"tset_today_{task_id}"),
-         InlineKeyboardButton("📆 Завтра", callback_data=f"tset_tomorrow_{task_id}")],
-        [InlineKeyboardButton("🗓 На неделю", callback_data=f"tset_week_{task_id}"),
-         InlineKeyboardButton("🗓 На месяц", callback_data=f"tset_month_{task_id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="tasks_all")]
-    ])
 
 def format_tasks(tasks, with_actions=False):
     if not tasks: return "Пусто 👌"
@@ -1939,16 +1760,6 @@ GOOGLE CALENDAR:
 
 {onboarding_block}
 {chr(10) + 'Профиль пользователя:' + chr(10) + profile_block if profile_block else ''}"""
-
-# Лимиты вывода по ролям запроса. Раньше везде было 1000 — переплата впустую,
-# потому что средний ответ Новы 150-300 токенов. Уменьшение max_tokens не режет
-# ответы (там прописано "не больше N строк" в промпте), но защищает от случаев
-# когда модель начинает зацикливаться или выдавать простыню.
-MAX_TOKENS_DEFAULT  = 700    # обычный диалог
-MAX_TOKENS_ONBOARD  = 1000   # онбординг — бывают длинные ответы с разбором
-MAX_TOKENS_NOTIF    = 500    # утро / вечер — короткие приветствия
-MAX_TOKENS_REVIEW   = 900    # еженедельный и месячный разбор
-MAX_TOKENS_VISION   = 800    # фото — описание + извлечение задач
 
 async def _call_openrouter(messages, system, model, max_tokens=MAX_TOKENS_DEFAULT):
     """Вызов через OpenRouter (OpenAI-compatible API)."""
