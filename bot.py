@@ -45,6 +45,10 @@ MEM0_API_KEY = os.environ.get("MEM0_API_KEY")
 # ID владельца бота (ты сама) — твой telegram user_id. Узнать: напиши /myid боту.
 # Только этот пользователь видит /admin и некоторые диагностические команды.
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+# Replicate API — для генерации изображений через FLUX.1 Schnell (~$0.003 за картинку).
+# Получи ключ на replicate.com/account/api-tokens, положи в Railway как REPLICATE_API_TOKEN.
+# Без ключа — команда /draw выдаст сообщение "функция пока не настроена".
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
 
 # ── Feature flag: монетизация ─────────────────────────────────────────────────
 # Когда False — все проверки тарифов отключены, команды /subscribe и платежи
@@ -425,6 +429,34 @@ def init_db():
         topic TEXT,
         created_at TEXT,
         discussed_at TEXT)""")
+    # Рефералы: кто кого пригласил. Заполняется при /start <ref_...>
+    c.execute("""CREATE TABLE IF NOT EXISTS referrals (
+        invited_user_id INTEGER PRIMARY KEY,
+        inviter_user_id INTEGER,
+        created_at TEXT,
+        rewarded_at TEXT)""")
+    # Промокоды: разовая активация даёт бонусные дни подписки.
+    c.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
+        code TEXT PRIMARY KEY,
+        plan TEXT,
+        days INTEGER,
+        max_uses INTEGER DEFAULT 1,
+        uses INTEGER DEFAULT 0,
+        expires_at TEXT,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS promo_redemptions (
+        user_id INTEGER,
+        code TEXT,
+        redeemed_at TEXT,
+        PRIMARY KEY (user_id, code))""")
+    # NPS/отзыв: через 14 дней после старта Нова спрашивает «Как тебе?».
+    # Ответ сохраняется. Поле asked_at = когда спросили, rating/feedback = ответ.
+    c.execute("""CREATE TABLE IF NOT EXISTS feedback (
+        user_id INTEGER PRIMARY KEY,
+        asked_at TEXT,
+        rating INTEGER,
+        text TEXT,
+        answered_at TEXT)""")
 
     # Индексы для всех горячих выборок по user_id — без них
     # SQLite сканирует всю таблицу, что на 500+ юзерах даёт задержки в секундах.
@@ -444,6 +476,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_usage_user_day     ON usage_counters(user_id, day)",
         "CREATE INDEX IF NOT EXISTS idx_expenses_user      ON expenses(user_id, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_parking_user       ON parking_lot(user_id, discussed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_referrals_inviter  ON referrals(inviter_user_id)",
     ]:
         try:
             c.execute(idx_sql)
@@ -463,6 +496,7 @@ USER_DATA_TABLES = [
     "mood_log", "energy_log", "habits", "habit_log",
     "journal", "wins", "sent_quotes", "followup_queue",
     "subscriptions", "usage_counters", "expenses", "parking_lot",
+    "referrals", "promo_redemptions", "feedback",
 ]
 
 def wipe_user_data(uid):
@@ -2450,6 +2484,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 "Не удалось создать счёт. Убедись что у тебя последняя версия Telegram.")
         return
+    # ── Забыть ──
+    if data == "forget_chat":
+        clear_history(uid)
+        await edit("🧹 Короткая история диалога очищена. Профиль и задачи на месте.")
+        return
+    if data == "forget_memory":
+        ok = mem0_delete_all_user(uid)
+        clear_history(uid)
+        await edit("🌫 Готово. Я забыла то что знала о тебе из прошлых разговоров — "
+                   "профиль, задачи и цели остались.")
+        return
+    # ── NPS-ответ (цифра 1-10) ──
+    if data.startswith("nps_"):
+        try:
+            rating = int(data.split("_", 1)[1])
+        except Exception:
+            return
+        db_exec("""UPDATE feedback SET rating=?, answered_at=? WHERE user_id=?""",
+                (rating, datetime.now().isoformat(), uid))
+        if rating <= 6:
+            await edit(f"Спасибо 🙏 Оценка *{rating}*. Что можно улучшить? Напиши мне прямо в чат — любую критику приму.",
+                       None)
+        elif rating <= 8:
+            await edit(f"Оценка *{rating}* — принято 💛 Если есть что предложить — напиши, я учту.")
+        else:
+            await edit(f"Оценка *{rating}* 🔥 Очень рада. Поделись со мной тем что нравится больше всего — или кинь "
+                       f"другу ссылку /invite.")
+        return
     # ── Возврат к отложенной теме ──
     if data.startswith("discuss_"):
         try:
@@ -2614,6 +2676,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
+    # Разбор реферального аргумента: /start ref_<id>
+    args = context.args if hasattr(context, "args") else []
+    if args and args[0].startswith("ref_"):
+        try:
+            inviter = int(args[0][4:])
+            record_referral(uid, inviter)
+            logging.info(f"Referral recorded: {inviter} invited {uid}")
+        except Exception as e:
+            logging.warning(f"Bad ref arg: {e}")
     user = get_user(uid)
     if user[1]:
         profile = get_profile(uid)
@@ -2943,6 +3014,379 @@ async def cmd_delete_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Это действие необратимо.*",
         parse_mode="Markdown", reply_markup=kb)
 
+# ── /city — указать свой город (для часового пояса и будущих фич) ────────────
+
+async def cmd_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает у пользователя город и сохраняет в profile.city.
+    Использование: /city или /city Москва (сразу с аргументом)."""
+    uid = update.effective_user.id
+    ensure_user(uid)
+    args = context.args if hasattr(context, "args") else []
+    if args:
+        city = " ".join(args).strip()
+        profile = get_profile(uid)
+        profile["city"] = city
+        save_profile(uid, profile)
+        await update.message.reply_text(
+            f"Запомнила: *{city}*. Теперь Нова знает где ты находишься.",
+            parse_mode="Markdown", reply_markup=main_keyboard())
+        return
+    # Без аргумента — подсказка
+    await update.message.reply_text(
+        "В каком ты городе? Напиши: `/city Москва` (или твой город).\n\n"
+        "Это нужно чтобы уведомления приходили в твоё местное время.",
+        parse_mode="Markdown", reply_markup=main_keyboard())
+
+# ── /forget — удаление конкретной памяти (Mem0 и история) ────────────────────
+
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Забыть то, что Нова запомнила. Варианты: короткая память (диалог),
+    долгая память (Mem0), или выборочно."""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Забыть только этот разговор",       callback_data="forget_chat")],
+        [InlineKeyboardButton("🌫 Забыть всё что помнишь обо мне",     callback_data="forget_memory")],
+        [InlineKeyboardButton("Отмена", callback_data="noop")],
+    ])
+    await update.message.reply_text(
+        "Что мне забыть?\n\n"
+        "• *Только этот разговор* — стерётся недавняя история сообщений. "
+        "Профиль, задачи и цели останутся.\n"
+        "• *Всё что помню о тебе* — уберу долгосрочную память (то что ты рассказывала ранее). "
+        "Профиль, задачи, цели тоже сохранятся.",
+        parse_mode="Markdown", reply_markup=kb)
+
+def mem0_delete_all_user(uid: int):
+    """Удаляет все воспоминания пользователя из Mem0 (долгосрочной памяти)."""
+    mem = get_mem0()
+    if not mem:
+        return False
+    try:
+        mem.delete_all(user_id=str(uid))
+        return True
+    except Exception as e:
+        logging.warning(f"Mem0 delete_all failed for {uid}: {e}")
+        return False
+
+# ── /backup — экспорт БД (только для владельца) ──────────────────────────────
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет владельцу бота дамп локальной БД как .db файл.
+    На Railway БД — временный SQLite; основной источник правды — Turso.
+    Эта команда полезна для локальной проверки или быстрого снимка."""
+    uid = update.effective_user.id
+    if not OWNER_ID or uid != OWNER_ID:
+        await update.message.reply_text("Эта команда только для владельца бота.")
+        return
+    import shutil
+    try:
+        src = "assistant.db"
+        if not os.path.exists(src):
+            await update.message.reply_text("Локальной assistant.db нет. Основные данные в Turso.")
+            return
+        snapshot = f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
+        shutil.copyfile(src, snapshot)
+        with open(snapshot, "rb") as f:
+            await update.message.reply_document(document=f, filename=snapshot,
+                                                caption=f"💾 Бэкап БД на {datetime.now():%d.%m.%Y %H:%M}")
+        try:
+            os.remove(snapshot)
+        except Exception:
+            pass
+    except Exception as e:
+        logging.error(f"Backup failed: {e}")
+        await update.message.reply_text(f"Не удалось сделать бэкап: {e}")
+
+# ── Реферальная программа ────────────────────────────────────────────────────
+
+def record_referral(invited_uid: int, inviter_uid: int):
+    """Фиксирует кто кого пригласил. Один раз — если запись уже есть, не трогаем."""
+    if invited_uid == inviter_uid:
+        return
+    existing = db_fetchone("SELECT inviter_user_id FROM referrals WHERE invited_user_id=?",
+                           (invited_uid,))
+    if existing:
+        return
+    db_exec("INSERT INTO referrals (invited_user_id, inviter_user_id, created_at) VALUES (?,?,?)",
+            (invited_uid, inviter_uid, datetime.now().isoformat()))
+
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает персональную реферальную ссылку.
+    Кто перейдёт и зарегистрируется — попадёт в таблицу referrals.
+    Когда монетизация включена, за приведённого друга можно выдавать бонусные дни."""
+    uid = update.effective_user.id
+    # Узнаём username бота из контекста
+    try:
+        me = await context.bot.get_me()
+        bot_username = me.username
+    except Exception:
+        bot_username = "your_bot"
+    link = f"https://t.me/{bot_username}?start=ref_{uid}"
+    total = db_fetchone("SELECT COUNT(*) FROM referrals WHERE inviter_user_id=?", (uid,))
+    count = total[0] if total else 0
+    await update.message.reply_text(
+        f"🔗 *Твоя пригласительная ссылка:*\n`{link}`\n\n"
+        f"Пригласила уже: *{count}*\n\n"
+        f"Отправь другу — если он зарегистрируется через твою ссылку, "
+        f"я это запомню. Когда запустится оплата, за каждого друга получишь бонусные дни.",
+        parse_mode="Markdown", reply_markup=main_keyboard())
+
+# ── Промокоды ────────────────────────────────────────────────────────────────
+
+def create_promo(code: str, plan: str = "basic", days: int = 30, max_uses: int = 1,
+                 expires_at: str | None = None):
+    """Создать промокод. Используется в /admin для владельца или вручную."""
+    db_exec("""INSERT OR REPLACE INTO promo_codes (code, plan, days, max_uses, uses, expires_at, created_at)
+               VALUES (?,?,?,?,0,?,?)""",
+            (code.upper(), plan, days, max_uses, expires_at, datetime.now().isoformat()))
+
+async def cmd_applycode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Применить промокод: /applycode ВЕСНА2026 — даст дни подписки."""
+    uid = update.effective_user.id
+    ensure_user(uid)
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.message.reply_text(
+            "Чтобы применить промокод, напиши: `/applycode <код>`",
+            parse_mode="Markdown", reply_markup=main_keyboard())
+        return
+    code = args[0].strip().upper()
+    row = db_fetchone("SELECT plan, days, max_uses, uses, expires_at FROM promo_codes WHERE code=?", (code,))
+    if not row:
+        await update.message.reply_text("Такого промокода нет или он уже неактивен.",
+                                        reply_markup=main_keyboard())
+        return
+    plan, days, max_uses, uses, expires_at = row
+    if expires_at:
+        try:
+            if datetime.fromisoformat(expires_at) < datetime.now():
+                await update.message.reply_text("Промокод истёк.", reply_markup=main_keyboard())
+                return
+        except Exception:
+            pass
+    if uses >= max_uses:
+        await update.message.reply_text("Промокод уже использован максимальное число раз.",
+                                        reply_markup=main_keyboard())
+        return
+    already = db_fetchone("SELECT 1 FROM promo_redemptions WHERE user_id=? AND code=?", (uid, code))
+    if already:
+        await update.message.reply_text("Ты уже применяла этот промокод.", reply_markup=main_keyboard())
+        return
+    # Даём дни: продлеваем подписку
+    now = datetime.now()
+    current = db_fetchone("SELECT valid_until FROM subscriptions WHERE user_id=?", (uid,))
+    base = now
+    if current and current[0]:
+        try:
+            dt = datetime.fromisoformat(current[0])
+            if dt > now:
+                base = dt
+        except Exception:
+            pass
+    new_until = (base + timedelta(days=days)).isoformat()
+    db_exec("""INSERT INTO subscriptions (user_id, plan, valid_until, last_payment_stars, last_payment_at)
+               VALUES (?,?,?,0,?)
+               ON CONFLICT(user_id) DO UPDATE SET plan=?, valid_until=?""",
+            (uid, plan, new_until, now.isoformat(), plan, new_until))
+    db_exec("INSERT INTO promo_redemptions (user_id, code, redeemed_at) VALUES (?,?,?)",
+            (uid, code, now.isoformat()))
+    db_exec("UPDATE promo_codes SET uses = uses + 1 WHERE code=?", (code,))
+    await update.message.reply_text(
+        f"✨ Промокод активирован! Тариф *{PLANS.get(plan, {}).get('title', plan)}* на *{days}* дней.",
+        parse_mode="Markdown", reply_markup=main_keyboard())
+
+# ── Генерация изображений (Pro-фича) ─────────────────────────────────────────
+
+async def call_replicate_flux(prompt: str) -> bytes | None:
+    """Генерирует картинку через Replicate FLUX.1 Schnell. Возвращает JPEG bytes или None."""
+    if not REPLICATE_API_TOKEN:
+        return None
+    try:
+        headers = {
+            "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient() as client:
+            # Создаём prediction (FLUX.1 Schnell — быстрая модель, 4 шага, ~2 сек)
+            r = await client.post(
+                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
+                headers=headers, timeout=60,
+                json={"input": {"prompt": prompt, "num_outputs": 1,
+                                 "aspect_ratio": "1:1", "output_format": "jpg"}})
+            data = r.json()
+            prediction_id = data.get("id")
+            if not prediction_id:
+                logging.error(f"Replicate: no prediction id: {data}")
+                return None
+            # Polling до готовности (обычно 2-5 сек)
+            for _ in range(30):
+                await asyncio.sleep(1)
+                rr = await client.get(
+                    f"https://api.replicate.com/v1/predictions/{prediction_id}",
+                    headers=headers, timeout=15)
+                pred = rr.json()
+                status = pred.get("status")
+                if status == "succeeded":
+                    output = pred.get("output")
+                    if isinstance(output, list) and output:
+                        img_url = output[0]
+                    elif isinstance(output, str):
+                        img_url = output
+                    else:
+                        return None
+                    # Скачиваем картинку
+                    img_r = await client.get(img_url, timeout=30)
+                    return img_r.content
+                if status == "failed" or status == "canceled":
+                    logging.error(f"Replicate failed: {pred.get('error')}")
+                    return None
+            return None
+    except Exception as e:
+        logging.error(f"Replicate error: {e}")
+        return None
+
+async def cmd_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сгенерировать картинку по тексту. /draw <описание>"""
+    uid = update.effective_user.id
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.message.reply_text(
+            "Опиши что нарисовать: `/draw закат над океаном, минимализм`",
+            parse_mode="Markdown", reply_markup=main_keyboard())
+        return
+    if not REPLICATE_API_TOKEN:
+        await update.message.reply_text(
+            "Генерация картинок пока не настроена. Владельцу бота нужно добавить "
+            "REPLICATE_API_TOKEN в настройки.",
+            reply_markup=main_keyboard())
+        return
+    # Rate-limit отдельно — картинка стоит денег
+    allowed, _ = check_rate_limit(uid)
+    if not allowed:
+        await update.message.reply_text("Подожди секунду после прошлого запроса 🙏")
+        return
+    prompt = " ".join(args).strip()
+    await update.message.reply_text("🎨 Рисую... обычно 3-5 секунд")
+    img_bytes = await call_replicate_flux(prompt)
+    if not img_bytes:
+        await update.message.reply_text("Не получилось сгенерировать( Попробуй другой запрос.",
+                                        reply_markup=main_keyboard())
+        return
+    bio = io.BytesIO(img_bytes); bio.name = "nova_draw.jpg"
+    await update.message.reply_photo(photo=bio, caption=f"🎨 _{prompt}_", parse_mode="Markdown",
+                                     reply_markup=main_keyboard())
+
+# ── Генерация PPTX-презентации ────────────────────────────────────────────────
+
+async def cmd_presentation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Быстрая генерация .pptx по теме. /presentation <тема>"""
+    uid = update.effective_user.id
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.message.reply_text(
+            "Напиши тему: `/presentation мои цели на 2026 год`",
+            parse_mode="Markdown", reply_markup=main_keyboard())
+        return
+    topic = " ".join(args).strip()
+    await update.message.reply_text("📊 Готовлю презентацию... 30-60 секунд")
+    # 1) Просим Claude сгенерировать структуру слайдов (JSON)
+    profile = get_profile(uid)
+    system = build_system(profile, uid=uid)
+    prompt = (
+        f"Пользователь попросил презентацию по теме: «{topic}».\n\n"
+        "Сгенерируй 5-7 слайдов как JSON-массив. Формат каждого слайда:\n"
+        '{"title": "Заголовок", "bullets": ["пункт 1", "пункт 2", "пункт 3"]}\n\n'
+        "Первый слайд — титул (без bullets, только title). Последний — вдохновляющее завершение.\n"
+        "Верни ТОЛЬКО чистый JSON-массив, без комментариев и тегов, без markdown-обрамления."
+    )
+    try:
+        raw = await call_claude([{"role": "user", "content": prompt}], system,
+                                model=MODEL_SMART, max_tokens=MAX_TOKENS_REVIEW)
+    except Exception as e:
+        logging.error(f"Presentation claude error: {e}")
+        await update.message.reply_text("Не получилось сгенерировать структуру(", reply_markup=main_keyboard())
+        return
+    # Парсим JSON
+    m = re.search(r'\[.*\]', raw, re.DOTALL)
+    if not m:
+        await update.message.reply_text("Не смогла разобрать структуру слайдов. Попробуй другую формулировку.",
+                                        reply_markup=main_keyboard())
+        return
+    try:
+        slides = json.loads(m.group(0))
+    except Exception as e:
+        logging.error(f"Presentation JSON parse: {e}")
+        await update.message.reply_text("Не удалось сформировать презентацию(", reply_markup=main_keyboard())
+        return
+    # 2) Собираем .pptx
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+    except ImportError:
+        await update.message.reply_text("Библиотека python-pptx не установлена.", reply_markup=main_keyboard())
+        return
+    prs = Presentation()
+    # Титульный слайд
+    if slides:
+        first = slides[0]
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
+        slide.shapes.title.text = first.get("title", topic)
+        if slide.placeholders and len(slide.placeholders) > 1:
+            try:
+                slide.placeholders[1].text = "Нова · твой ассистент"
+            except Exception:
+                pass
+    # Контентные слайды
+    for sl in slides[1:]:
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = sl.get("title", "")
+        body = slide.placeholders[1]
+        tf = body.text_frame
+        tf.clear()
+        bullets = sl.get("bullets", [])
+        if bullets:
+            tf.text = bullets[0]
+            for b in bullets[1:]:
+                p = tf.add_paragraph()
+                p.text = b
+    bio = io.BytesIO()
+    prs.save(bio)
+    bio.seek(0)
+    bio.name = f"nova_presentation.pptx"
+    await update.message.reply_document(document=bio, filename=bio.name,
+                                        caption=f"📊 Презентация: _{topic}_",
+                                        parse_mode="Markdown")
+
+# ── NPS / отзыв (через 14 дней после регистрации) ────────────────────────────
+
+async def check_feedback(context):
+    """Раз в сутки (jobs) ищем юзеров, которым пора задать NPS-вопрос.
+    Условие: прошло 14+ дней с первого сообщения, ещё не спрашивали."""
+    cutoff = (datetime.now() - timedelta(days=14)).isoformat()
+    # Юзеры у которых есть messages старше 14 дней и НЕТ записи в feedback
+    candidates = db_fetch("""
+        SELECT DISTINCT m.user_id
+        FROM messages m
+        LEFT JOIN feedback f ON f.user_id = m.user_id
+        WHERE m.created_at <= ?
+          AND f.user_id IS NULL
+        LIMIT 50""", (cutoff,))
+    for (uid,) in candidates:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(i), callback_data=f"nps_{i}") for i in range(1, 6)],
+            [InlineKeyboardButton(str(i), callback_data=f"nps_{i}") for i in range(6, 11)],
+        ])
+        try:
+            await context.bot.send_message(uid,
+                "Мы с тобой уже две недели вместе 🌿\n\n"
+                "На сколько оцениваешь меня от 1 до 10? Просто нажми цифру.\n"
+                "_(1 — «удали, пожалуйста», 10 — «невозможно без Новы»)_",
+                parse_mode="Markdown", reply_markup=kb)
+            db_exec("INSERT OR IGNORE INTO feedback (user_id, asked_at) VALUES (?,?)",
+                    (uid, datetime.now().isoformat()))
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logging.warning(f"NPS send failed {uid}: {e}")
+
 # ── Отложенные темы (парковка) ───────────────────────────────────────────────
 
 async def cmd_parking(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2990,15 +3434,56 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msgs_24h = db_fetchone(
         "SELECT COUNT(*) FROM messages WHERE created_at >= ? AND role='assistant'",
         ((datetime.now() - timedelta(days=1)).isoformat(),))[0]
-    await update.message.reply_text(
+    refs = db_fetchone("SELECT COUNT(*) FROM referrals")[0]
+    nps = db_fetch("SELECT rating FROM feedback WHERE rating IS NOT NULL")
+    nps_line = ""
+    if nps:
+        avg = sum(r[0] for r in nps) / len(nps)
+        nps_line = f"\nСредний NPS: *{avg:.1f}/10* ({len(nps)} ответов)"
+
+    # График роста юзеров по дням за последние 14 дней
+    chart_bio = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from collections import Counter
+        rows = db_fetch("""SELECT DATE(created_at) FROM messages
+                           WHERE created_at >= ? AND role='assistant'
+                           ORDER BY created_at""",
+                        ((datetime.now() - timedelta(days=14)).isoformat(),))
+        counter = Counter([r[0] for r in rows if r[0]])
+        if counter:
+            days = sorted(counter.keys())
+            values = [counter[d] for d in days]
+            fig, ax = plt.subplots(figsize=(9, 4))
+            ax.bar(days, values, color="#6C8EBF")
+            ax.set_title("Ответы Новы за 14 дней")
+            ax.set_ylabel("Сообщений")
+            plt.xticks(rotation=45, ha="right", fontsize=8)
+            plt.tight_layout()
+            bio = io.BytesIO()
+            plt.savefig(bio, format="png", dpi=100)
+            plt.close(fig)
+            bio.seek(0); bio.name = "admin_chart.png"
+            chart_bio = bio
+    except Exception as e:
+        logging.warning(f"Admin chart failed: {e}")
+
+    text = (
         "*📊 Статистика Новы*\n\n"
         f"Всего юзеров: *{total_users}*\n"
         f"Активных за сутки: *{active_today}*\n"
         f"Активных за 7 дней: *{active_7d}*\n\n"
         f"Платных подписок: *{paid[0] if paid else 0}*\n"
-        f"Всего Stars получено: *{paid[1] if paid else 0}⭐*\n\n"
-        f"Ответов Новы за 24ч: *{msgs_24h}*",
-        parse_mode="Markdown")
+        f"Всего Stars получено: *{paid[1] if paid else 0}⭐*\n"
+        f"Рефералов зафиксировано: *{refs}*{nps_line}\n\n"
+        f"Ответов Новы за 24ч: *{msgs_24h}*"
+    )
+    if chart_bio:
+        await update.message.reply_photo(photo=chart_bio, caption=text, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -3100,15 +3585,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *🔧 Настройки*
 /checkin — чекин состояния
 /profile — мой профиль
+/city — указать свой город
 /settings — уведомления, часовой пояс, стиль
 /calendar — подключить Google Календарь
 /calshow — показать события в Calendar
 /report — отчёт, графики, PDF
 
+*🎨 Креатив*
+/draw — сгенерировать картинку по описанию
+/presentation — сделать .pptx по теме
+
 *💳 Финансы*
 /finance — траты за месяц (фото чека → учёт)
 {subscribe_block}
+*🤝 Друзьям*
+/invite — моя ссылка-приглашение
+/applycode — применить промокод
+
 *🔒 Приватность*
+/forget — забыть разговор или память обо мне
+/parking — вернуться к отложенным темам
 /export — скачать все мои данные
 /delete\\_me — удалить меня и все данные
 
@@ -3997,12 +4493,19 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("plan",    cmd_plan))
     # Новые команды: финансы, GDPR, админ, парковка (доступны всегда)
-    app.add_handler(CommandHandler("finance",   cmd_finance))
-    app.add_handler(CommandHandler("export",    cmd_export))
-    app.add_handler(CommandHandler("delete_me", cmd_delete_me))
-    app.add_handler(CommandHandler("myid",      cmd_myid))
-    app.add_handler(CommandHandler("admin",     cmd_admin))
-    app.add_handler(CommandHandler("parking",   cmd_parking))
+    app.add_handler(CommandHandler("finance",       cmd_finance))
+    app.add_handler(CommandHandler("export",        cmd_export))
+    app.add_handler(CommandHandler("delete_me",     cmd_delete_me))
+    app.add_handler(CommandHandler("myid",          cmd_myid))
+    app.add_handler(CommandHandler("admin",         cmd_admin))
+    app.add_handler(CommandHandler("parking",       cmd_parking))
+    app.add_handler(CommandHandler("city",          cmd_city))
+    app.add_handler(CommandHandler("forget",        cmd_forget))
+    app.add_handler(CommandHandler("invite",        cmd_invite))
+    app.add_handler(CommandHandler("applycode",     cmd_applycode))
+    app.add_handler(CommandHandler("draw",          cmd_draw))
+    app.add_handler(CommandHandler("presentation",  cmd_presentation))
+    app.add_handler(CommandHandler("backup",        cmd_backup))
     # Команды и хендлеры монетизации — регистрируем только если PAYMENTS_ENABLED.
     # Код cmd_subscribe и Stars-handlers сохранён в файле на будущее.
     if PAYMENTS_ENABLED:
@@ -4026,6 +4529,8 @@ def main():
     jq.run_repeating(evening, interval=3600, first=120)
     jq.run_repeating(weekly_review, interval=3600, first=180)
     jq.run_repeating(check_followup, interval=1800, first=300)
+    # NPS-опрос: проверяем раз в сутки
+    jq.run_repeating(check_feedback, interval=86400, first=600)
 
     from telegram import BotCommand
 
@@ -4055,10 +4560,16 @@ def main():
         BotCommand("settings", "Настройки"),
         BotCommand("profile",  "Мой профиль"),
         BotCommand("plan",     "Недельный план — задачи + приоритеты"),
-        BotCommand("finance",  "Мои траты (распознаю по фото чека)"),
-        BotCommand("parking",  "Вернуться к отложенным темам из знакомства"),
-        BotCommand("export",   "Скачать все свои данные"),
-        BotCommand("delete_me","Удалить все мои данные"),
+        BotCommand("finance",      "Мои траты (распознаю по фото чека)"),
+        BotCommand("parking",      "Вернуться к отложенным темам из знакомства"),
+        BotCommand("city",         "Указать свой город"),
+        BotCommand("invite",       "Моя реферальная ссылка"),
+        BotCommand("applycode",    "Применить промокод"),
+        BotCommand("draw",         "Сгенерировать картинку"),
+        BotCommand("presentation", "Сделать презентацию .pptx"),
+        BotCommand("forget",       "Забыть разговор или память"),
+        BotCommand("export",       "Скачать все свои данные"),
+        BotCommand("delete_me",    "Удалить все мои данные"),
     ]
     if PAYMENTS_ENABLED:
         BOT_COMMANDS.append(BotCommand("subscribe", "Мой тариф и подписка"))
