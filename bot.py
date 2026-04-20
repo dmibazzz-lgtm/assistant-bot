@@ -46,6 +46,15 @@ MEM0_API_KEY = os.environ.get("MEM0_API_KEY")
 # Только этот пользователь видит /admin и некоторые диагностические команды.
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 
+# ── Feature flag: монетизация ─────────────────────────────────────────────────
+# Когда False — все проверки тарифов отключены, команды /subscribe и платежи
+# НЕ регистрируются, лимиты сообщений не применяются. Все юзеры получают
+# полный доступ бесплатно. Весь код ниже (PLANS, check_plan_limit, Stars-handlers)
+# СОХРАНЁН — чтобы включить обратно достаточно поставить True.
+#
+# Можно переопределить через переменную окружения PAYMENTS_ENABLED=true на Railway.
+PAYMENTS_ENABLED = os.environ.get("PAYMENTS_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+
 # ── Тарифы и монетизация ──────────────────────────────────────────────────────
 # Цены в Telegram Stars (XTR). 1 Star ≈ 1.5-2 ₽.
 #
@@ -776,6 +785,9 @@ def check_plan_limit(uid: int, kind: str = "msg") -> tuple[bool, str]:
     """Проверяет доступ и дневной лимит.
     kind: 'msg' | 'voice' | 'photo'. Возвращает (ok, reason_text).
     Сам счётчик НЕ инкрементирует — это делает bump_usage() после успешной обработки."""
+    # Если монетизация выключена флагом — всем всё разрешено, без лимитов.
+    if not PAYMENTS_ENABLED:
+        return True, ""
     plan = get_user_plan(uid)
     if plan == PLAN_EXPIRED:
         return False, (
@@ -2312,6 +2324,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # ── Покупка подписки ──
     if data in ("buy_basic", "buy_pro"):
+        if not PAYMENTS_ENABLED:
+            await query.message.reply_text("Оплата сейчас отключена. Попробуй позже.")
+            return
         plan_key = data.split("_", 1)[1]
         try:
             await send_stars_invoice(context, uid, plan_key)
@@ -2886,7 +2901,8 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Как ты сейчас? 🙂", reply_markup=main_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """*Нова — твой личный ассистент* 🤖
+    subscribe_block = "/subscribe — мой тариф и подписка\n" if PAYMENTS_ENABLED else ""
+    text = f"""*Нова — твой личный ассистент* 🤖
 
 *📋 Задачи и планирование*
 /today — задачи на сегодня
@@ -2920,13 +2936,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /calshow — показать события в Calendar
 /report — отчёт, графики, PDF
 
-*💳 Финансы и подписка*
+*💳 Финансы*
 /finance — траты за месяц (фото чека → учёт)
-/subscribe — мой тариф и подписка
-
+{subscribe_block}
 *🔒 Приватность*
 /export — скачать все мои данные
-/delete\_me — удалить меня и все данные
+/delete\\_me — удалить меня и все данные
 
 Пишу в любом формате — текст, голос, фото 🎤📸"""
     await send_safe(update, text, main_keyboard())
@@ -3812,21 +3827,26 @@ def main():
     app.add_handler(CommandHandler("settings",cmd_settings))
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("plan",    cmd_plan))
-    # Новые команды: подписка, финансы, GDPR, админ
-    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    # Новые команды: финансы, GDPR, админ (доступны всегда)
     app.add_handler(CommandHandler("finance",   cmd_finance))
     app.add_handler(CommandHandler("export",    cmd_export))
     app.add_handler(CommandHandler("delete_me", cmd_delete_me))
     app.add_handler(CommandHandler("myid",      cmd_myid))
     app.add_handler(CommandHandler("admin",     cmd_admin))
+    # Команды и хендлеры монетизации — регистрируем только если PAYMENTS_ENABLED.
+    # Код cmd_subscribe и Stars-handlers сохранён в файле на будущее.
+    if PAYMENTS_ENABLED:
+        app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+        from telegram.ext import PreCheckoutQueryHandler
+        app.add_handler(PreCheckoutQueryHandler(handle_pre_checkout))
+        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
+        logging.info("Payments: ENABLED")
+    else:
+        logging.info("Payments: disabled (set PAYMENTS_ENABLED=true to enable)")
     # Скрытые команды — не показываются в меню BotFather
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("newuser", cmd_newuser))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    # Платежи Telegram Stars
-    from telegram.ext import PreCheckoutQueryHandler
-    app.add_handler(PreCheckoutQueryHandler(handle_pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -3866,10 +3886,11 @@ def main():
         BotCommand("profile",  "Мой профиль"),
         BotCommand("plan",     "Недельный план — задачи + приоритеты"),
         BotCommand("finance",  "Мои траты (распознаю по фото чека)"),
-        BotCommand("subscribe","Мой тариф и подписка"),
         BotCommand("export",   "Скачать все свои данные"),
         BotCommand("delete_me","Удалить все мои данные"),
     ]
+    if PAYMENTS_ENABLED:
+        BOT_COMMANDS.append(BotCommand("subscribe", "Мой тариф и подписка"))
 
     async def start_web(app_obj):
         await app_obj.bot.set_my_commands(BOT_COMMANDS)
