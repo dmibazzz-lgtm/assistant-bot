@@ -3139,6 +3139,41 @@ def create_promo(code: str, plan: str = "basic", days: int = 30, max_uses: int =
                VALUES (?,?,?,?,0,?,?)""",
             (code.upper(), plan, days, max_uses, expires_at, datetime.now().isoformat()))
 
+async def cmd_createpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OWNER_ID может создать промокод прямо из чата.
+    Формат: /createpromo КОД [plan=basic] [days=30] [uses=1]
+    Пример: /createpromo ВЕСНА2026 basic 30 100  (код ВЕСНА2026, basic, 30 дней, до 100 применений)"""
+    uid = update.effective_user.id
+    if not OWNER_ID or uid != OWNER_ID:
+        await update.message.reply_text("Команда только для владельца бота.")
+        return
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.message.reply_text(
+            "Формат: `/createpromo КОД [plan] [days] [max_uses]`\n"
+            "Пример: `/createpromo ВЕСНА2026 basic 30 100`\n"
+            "По умолчанию: plan=basic, days=30, max_uses=1",
+            parse_mode="Markdown")
+        return
+    code = args[0].upper()
+    plan = args[1] if len(args) > 1 else "basic"
+    try:
+        days = int(args[2]) if len(args) > 2 else 30
+        max_uses = int(args[3]) if len(args) > 3 else 1
+    except ValueError:
+        await update.message.reply_text("days и max_uses должны быть числами.")
+        return
+    if plan not in PLANS:
+        await update.message.reply_text(f"Неизвестный тариф «{plan}». Доступны: {', '.join(PLANS.keys())}")
+        return
+    create_promo(code, plan=plan, days=days, max_uses=max_uses)
+    await update.message.reply_text(
+        f"✅ Промокод *{code}* создан\n"
+        f"Тариф: {PLANS[plan]['title']}\n"
+        f"Срок: {days} дней\n"
+        f"Макс. использований: {max_uses}",
+        parse_mode="Markdown")
+
 async def cmd_applycode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Применить промокод: /applycode ВЕСНА2026 — даст дни подписки."""
     uid = update.effective_user.id
@@ -4503,6 +4538,7 @@ def main():
     app.add_handler(CommandHandler("forget",        cmd_forget))
     app.add_handler(CommandHandler("invite",        cmd_invite))
     app.add_handler(CommandHandler("applycode",     cmd_applycode))
+    app.add_handler(CommandHandler("createpromo",   cmd_createpromo))
     app.add_handler(CommandHandler("draw",          cmd_draw))
     app.add_handler(CommandHandler("presentation",  cmd_presentation))
     app.add_handler(CommandHandler("backup",        cmd_backup))
